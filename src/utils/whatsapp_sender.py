@@ -14,7 +14,15 @@ class WhatsAppSender:
         self.account_sid = os.getenv('TWILIO_ACCOUNT_SID')
         self.auth_token = os.getenv('TWILIO_AUTH_TOKEN')
         self.twilio_number = os.getenv('TWILIO_WHATSAPP_NUMBER', 'whatsapp:+14155238886')
-        self.client = Client(self.account_sid, self.auth_token)
+        self._client = None
+
+    @property
+    def client(self):
+        if self._client is None:
+            if not self.account_sid or not self.auth_token:
+                raise ValueError("TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN must be set")
+            self._client = Client(self.account_sid, self.auth_token)
+        return self._client
     
     @staticmethod
     def format_forecast_message(prices: List[float]) -> str:
