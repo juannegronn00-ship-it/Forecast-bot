@@ -20,7 +20,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('forecast_bot.log'),
+        logging.FileHandler('/tmp/forecast_bot.log'),
         logging.StreamHandler()
     ]
 )
