@@ -58,8 +58,9 @@ class WhatsAppSender:
             logger.warning("No destination number provided — skipping WhatsApp send")
             return False
 
-        # Normalize to E.164: strip existing prefix, ensure leading +
+        # Normalize to E.164: strip whitespace/newlines, strip prefix, ensure +
         raw = to_number.replace("whatsapp:", "").strip()
+        raw = "".join(c for c in raw if c.isdigit() or c == "+")
         if not raw.startswith("+"):
             raw = "+" + raw
         to = f"whatsapp:{raw}"
