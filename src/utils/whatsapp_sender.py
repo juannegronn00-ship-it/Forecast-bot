@@ -58,7 +58,11 @@ class WhatsAppSender:
             logger.warning("No destination number provided — skipping WhatsApp send")
             return False
 
-        to = f"whatsapp:{to_number}" if not to_number.startswith("whatsapp:") else to_number
+        # Normalize to E.164: strip existing prefix, ensure leading +
+        raw = to_number.replace("whatsapp:", "").strip()
+        if not raw.startswith("+"):
+            raw = "+" + raw
+        to = f"whatsapp:{raw}"
         body = self.format_forecast_message(prices)
 
         try:
