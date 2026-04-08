@@ -23,6 +23,10 @@ class WhatsAppSender:
                 raise ValueError("TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN must be set")
             self._client = Client(self.account_sid, self.auth_token)
         return self._client
+
+    @property
+    def available(self) -> bool:
+        return bool(self.account_sid and self.auth_token)
     
     @staticmethod
     def format_forecast_message(prices: List[float]) -> str:

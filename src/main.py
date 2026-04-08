@@ -28,14 +28,20 @@ logger = logging.getLogger(__name__)
 
 class ForecastBot:
     """Main bot that orchestrates the entire forecasting pipeline"""
-    
+
     def __init__(self):
+        required = {
+            'CLAUDE_API_KEY': os.getenv('CLAUDE_API_KEY'),
+        }
+        missing = [k for k, v in required.items() if not v]
+        if missing:
+            raise EnvironmentError(f"Missing required env vars: {missing}")
+
         self.fantods = FantodsScraperr()
         self.miso = MISOScraper()
         self.matcher = HourMatcher()
         self.refiner = AIRefiner()
         self.sender = WhatsAppSender()
-        self.scheduler = BackgroundScheduler()
     
     def run_forecast(self):
         """
@@ -158,33 +164,33 @@ class ForecastBot:
         
         # STEP 6: Send via WhatsApp
         logger.info("\n[6/6] Sending via WhatsApp...")
-        
-        # Calculate metadata
-        metadata = self.sender.calculate_metadata(final_prices)
-        
-        # Send to stepdad
-        stepdad_sent = self.sender.send_to_stepdad(final_prices)
-        if stepdad_sent:
-            logger.info("✅ WhatsApp sent to stepdad")
+
+        if not self.sender.available:
+            logger.warning("⚠️ Twilio credentials not configured, skipping WhatsApp send")
         else:
-            logger.error("❌ Failed to send WhatsApp to stepdad")
-        
-        # Send to you
-        you_sent = self.sender.send_to_you(final_prices, metadata)
-        if you_sent:
-            logger.info("✅ WhatsApp sent to you (monitoring)")
-        else:
-            logger.warning("⚠️ Failed to send WhatsApp to you")
-        
+            metadata = self.sender.calculate_metadata(final_prices)
+
+            stepdad_sent = self.sender.send_to_stepdad(final_prices)
+            if stepdad_sent:
+                logger.info("✅ WhatsApp sent to stepdad")
+            else:
+                logger.warning("⚠️ Failed to send WhatsApp to stepdad")
+
+            you_sent = self.sender.send_to_you(final_prices, metadata)
+            if you_sent:
+                logger.info("✅ WhatsApp sent to you (monitoring)")
+            else:
+                logger.warning("⚠️ Failed to send WhatsApp to you")
+
         logger.info("\n" + "="*60)
         logger.info("✅ FORECAST PIPELINE COMPLETE")
         logger.info("="*60 + "\n")
-        
-        return stepdad_sent
+
+        return final_prices
     
     def start_scheduler(self):
         """Start the APScheduler to run forecasts daily at 7:00 AM"""
-        
+        self.scheduler = BackgroundScheduler()
         # Schedule forecast to run every day at 7:00 AM
         self.scheduler.add_job(
             self.run_forecast,
@@ -215,10 +221,6 @@ def main():
     # Check environment variables
     required_vars = [
         'CLAUDE_API_KEY',
-        'GEMINI_API_KEY',
-        'TWILIO_ACCOUNT_SID',
-        'TWILIO_AUTH_TOKEN',
-        'STEPDAD_WHATSAPP'
     ]
     
     missing_vars = [var for var in required_vars if not os.getenv(var)]
@@ -233,11 +235,11 @@ def main():
     logger.info("\n--- RUNNING FIRST FORECAST TEST ---\n")
     success = bot.run_once()
     
-    if success:
+    if success is not False:
         logger.info("\n--- FIRST FORECAST SUCCESSFUL ---")
         logger.info("Starting scheduler for daily forecasts...\n")
         bot.start_scheduler()
-        
+
         # Keep scheduler running
         try:
             while True:

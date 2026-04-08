@@ -1,16 +1,8 @@
 {
-  "buildCommand": "pip install -r requirements.txt",
-  "outputDirectory": ".",
-  "functions": {
-    "api/forecast.py": {
-      "runtime": "python3.9",
-      "maxDuration": 300
-    }
-  },
   "crons": [
     {
       "path": "/api/forecast",
-      "schedule": "0 7 * * *"
+      "schedule": "0 12 * * *"
     }
   ]
 }
