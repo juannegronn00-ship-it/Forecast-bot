@@ -34,15 +34,18 @@ class handler(BaseHTTPRequestHandler):
 
             # Attempt WhatsApp send and report the outcome explicitly
             sender = WhatsAppSender()
-            stepdad_ok = sender.send_to_stepdad(final_prices)
-            your_ok = sender.send_to_you(final_prices)
+            stepdad_ok, stepdad_err = sender.send_to_stepdad(final_prices)
+            your_ok, your_err = sender.send_to_you(final_prices)
+
+            whatsapp = {"stepdad": stepdad_ok, "monitor": your_ok}
+            if stepdad_err:
+                whatsapp["stepdad_error"] = stepdad_err
+            if your_err:
+                whatsapp["monitor_error"] = your_err
 
             self._respond(200, {
                 "success": True,
-                "whatsapp": {
-                    "stepdad": stepdad_ok,
-                    "monitor": your_ok,
-                },
+                "whatsapp": whatsapp,
                 "forecast": {
                     "hours": final_prices,
                     "avg": round(sum(final_prices) / 24, 2),

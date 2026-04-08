@@ -49,14 +49,17 @@ class WhatsAppSender:
         lines += ["", f"Avg: ${avg:.2f}  Min: ${min(prices):.2f}  Max: ${max(prices):.2f}"]
         return "\n".join(lines)
 
-    def send(self, to_number: str, prices: List[float]) -> bool:
-        """Send forecast to a single WhatsApp number. Returns True on success."""
+    def send(self, to_number: str, prices: List[float]) -> tuple:
+        """Send forecast to a single WhatsApp number.
+        Returns (success: bool, error: str|None)."""
         if not self.available:
-            logger.warning("Twilio credentials not set — skipping WhatsApp send")
-            return False
+            msg = "Twilio credentials not set"
+            logger.warning(msg)
+            return False, msg
         if not to_number:
-            logger.warning("No destination number provided — skipping WhatsApp send")
-            return False
+            msg = "No destination number provided"
+            logger.warning(msg)
+            return False, msg
 
         # Normalize to E.164: strip whitespace/newlines, strip prefix, ensure +
         raw = to_number.replace("whatsapp:", "").strip()
@@ -66,25 +69,26 @@ class WhatsAppSender:
         to = f"whatsapp:{raw}"
         body = self.format_forecast_message(prices)
 
+        logger.info(f"Sending WhatsApp from={self.from_number} to={to}")
+
         try:
             result = _post_message(self.account_sid, self.auth_token, self.from_number, to, body)
-            logger.info(f"WhatsApp sent to {to_number} (SID: {result.get('sid')})")
-            return True
+            logger.info(f"WhatsApp sent to {raw} (SID: {result.get('sid')})")
+            return True, None
         except Exception as e:
-            logger.error(f"WhatsApp send failed to {to_number}: {e}")
-            return False
+            logger.error(f"WhatsApp send failed to {raw}: {e}")
+            return False, str(e)
 
-    def send_to_stepdad(self, prices: List[float]) -> bool:
+    def send_to_stepdad(self, prices: List[float]) -> tuple:
         number = os.getenv("STEPDAD_WHATSAPP", "")
         if not number:
-            logger.error("STEPDAD_WHATSAPP env var not set")
-            return False
+            return False, "STEPDAD_WHATSAPP env var not set"
         return self.send(number, prices)
 
-    def send_to_you(self, prices: List[float], metadata: Dict = None) -> bool:
+    def send_to_you(self, prices: List[float], metadata: Dict = None) -> tuple:
         number = os.getenv("YOUR_WHATSAPP", "")
         if not number:
-            return True  # optional — not an error
+            return True, None  # optional — not an error
         return self.send(number, prices)
 
     @staticmethod
