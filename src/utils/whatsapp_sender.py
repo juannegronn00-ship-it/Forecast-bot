@@ -20,8 +20,13 @@ class WhatsAppSender:
     def client(self):
         if self._client is None:
             if not self.account_sid or not self.auth_token:
-                raise ValueError("TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN must be set")
-            self._client = Client(self.account_sid, self.auth_token)
+                logger.warning("TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN must be set")
+                return None
+            try:
+                self._client = Client(self.account_sid, self.auth_token)
+            except Exception as e:
+                logger.error(f"Failed to initialize Twilio client: {e}")
+                return None
         return self._client
 
     @property
