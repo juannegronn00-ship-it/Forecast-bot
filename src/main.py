@@ -1,38 +1,48 @@
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from apscheduler.schedulers.background import BackgroundScheduler
-import atexit
 
-# Import our modules
 from src.scrapers.fantods_scraper import FantodsScraperr
 from src.scrapers.miso_scraper import MISOScraper
 from src.utils.matcher import HourMatcher
 from src.ai.refinement import AIRefiner
 from src.utils.whatsapp_sender import WhatsAppSender
 
-# Load environment variables
 load_dotenv()
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler('/tmp/forecast_bot.log'),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler("/tmp/forecast_bot.log"),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
+# Typical MISO spring load shape (GW) — used when all scrapers fail
+SYNTHETIC_LOAD = [
+    88, 85, 83, 82, 83, 86, 92, 100, 105, 107, 108, 108,
+    107, 106, 106, 107, 110, 114, 116, 114, 111, 106, 99, 93,
+]
+# Typical MISO spring wind generation shape (GW)
+SYNTHETIC_WIND = [
+    12, 13, 14, 14, 13, 12, 10, 9, 8, 8, 9, 10,
+    11, 12, 12, 11, 10, 9, 9, 10, 11, 12, 12, 12,
+]
+# Typical MISO spring DA-LMP shape ($/MWh) — fallback if fantods fails
+SYNTHETIC_PRICES = [
+    22, 21, 20, 20, 21, 23, 28, 35, 38, 36, 34, 33,
+    32, 31, 32, 34, 37, 42, 45, 43, 40, 36, 30, 25,
+]
+
+
 class ForecastBot:
-    """Main bot that orchestrates the entire forecasting pipeline"""
+    """Orchestrates the full DA-LMP forecasting pipeline."""
 
     def __init__(self):
-        required = {
-            'CLAUDE_API_KEY': os.getenv('CLAUDE_API_KEY'),
-        }
+        required = {"CLAUDE_API_KEY": os.getenv("CLAUDE_API_KEY")}
         missing = [k for k, v in required.items() if not v]
         if missing:
             raise EnvironmentError(f"Missing required env vars: {missing}")
@@ -42,213 +52,201 @@ class ForecastBot:
         self.matcher = HourMatcher()
         self.refiner = AIRefiner()
         self.sender = WhatsAppSender()
-    
-    def run_forecast(self):
+
+    # ------------------------------------------------------------------ #
+    # Core pipeline  (does NOT send WhatsApp — callers handle that)
+    # ------------------------------------------------------------------ #
+    def run_forecast(self) -> list:
         """
-        Execute complete forecast pipeline:
-        1. Scrape data from both sources
-        2. Generate base prices via matching algorithm
-        3. Refine with Claude AI
-        4. Validate with Gemini AI
-        5. Send via WhatsApp
+        Execute forecast pipeline and return 24 final prices.
+        WhatsApp delivery is intentionally NOT done here — the caller
+        (api/index.py or run_once) is responsible, so we never double-send.
+
+        Steps:
+          1. Scrape fantods for DA-LMP base prices
+          2. Fetch MISO load/wind forecasts
+          3. Claude expert refinement (capped adjustments)
+          4. Gemini validation + surgical corrections
+          5. Merge and return final prices
         """
-        logger.info("="*60)
+        logger.info("=" * 60)
         logger.info("STARTING FORECAST PIPELINE")
-        logger.info("="*60)
-        
-        # STEP 1: Scrape data
-        logger.info("\n[1/6] Scraping data sources...")
-        
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%B %d, %Y")
+        logger.info(f"Forecasting for: {tomorrow}")
+        logger.info("=" * 60)
+
+        # ---------------------------------------------------------------- #
+        # STEP 1: Fantods — base DA-LMP prices
+        # ---------------------------------------------------------------- #
+        logger.info("\n[1/5] Scraping fantods for DA-LMP base prices...")
         fantods_result = self.fantods.scrape_data()
-        if not fantods_result['success']:
-            logger.error(f"Fantods scrape failed: {fantods_result.get('error')}")
-            return False
-        
-        logger.info("✅ Fantods scraped successfully")
-        
-        miso_result = self.miso.fetch_data()
-        if miso_result['success']:
-            logger.info("✅ MISO CSV fetched successfully")
+
+        if fantods_result["success"]:
+            base_prices = fantods_result["prices_by_hour"]
+            logger.info(f"✅ Fantods OK: {len(base_prices)} prices, avg=${sum(base_prices)/len(base_prices):.2f}")
         else:
-            logger.warning("⚠️ MISO fetch failed, using fantods data only")
-        
-        # Use fantods as primary, MISO for validation
-        load_forecast = fantods_result.get('load_forecast', [])
-        wind_forecast = fantods_result.get('wind_forecast', [])
-        
-        if miso_result['success']:
-            # Verify consistency between sources
-            miso_load = miso_result.get('load_forecast', [])
-            if miso_load and abs(sum(miso_load) - sum(load_forecast)) / sum(load_forecast) < 0.1:
-                logger.info("✅ Load forecasts match between sources")
-            else:
-                logger.warning("⚠️ Load forecast mismatch between sources, using fantods")
-        
-        # STEP 2: Generate base prices
-        logger.info("\n[2/6] Generating base prices via pattern matching...")
-        
-        # For MVP, use simple averaging of available data
-        # In full version, would use real historical data from database
-        base_prices = fantods_result.get('prices_by_hour', [])
-        
-        if not base_prices or len(base_prices) < 24:
-            logger.warning("No prices from fantods, using synthetic data")
-            # Typical MISO shape: low off-peak, moderate peak, $/MWh
-            base_prices = [
-                22, 21, 20, 20, 21, 23, 28, 35, 38, 36, 34, 33,
-                32, 31, 32, 34, 37, 42, 45, 43, 40, 36, 30, 25
-            ]
-        
-        logger.info(f"✅ Generated {len(base_prices)} base prices (avg: ${sum(base_prices)/len(base_prices):.2f})")
-        
-        # STEP 3: Claude refinement
-        logger.info("\n[3/6] Refining prices with Claude AI...")
+            logger.warning(f"⚠️  Fantods failed: {fantods_result.get('error')} — using synthetic prices")
+            base_prices = list(SYNTHETIC_PRICES)
 
-        # Use synthetic load/wind shape if real forecasts unavailable
-        if not load_forecast or len(load_forecast) < 24:
-            logger.warning("No load forecast available, using synthetic MISO shape")
-            load_forecast = [
-                88, 85, 83, 82, 83, 86, 92, 100, 105, 107, 108, 108,
-                107, 106, 106, 107, 110, 114, 116, 114, 111, 106, 99, 93
-            ]
-        if not wind_forecast or len(wind_forecast) < 24:
-            logger.warning("No wind forecast available, using synthetic shape")
-            wind_forecast = [
-                12, 13, 14, 14, 13, 12, 10, 9, 8, 8, 9, 10,
-                11, 12, 12, 11, 10, 9, 9, 10, 11, 12, 12, 12
-            ]
+        # Pad/trim to exactly 24
+        while len(base_prices) < 24:
+            base_prices.append(base_prices[-1] if base_prices else 30.0)
+        base_prices = base_prices[:24]
 
+        # ---------------------------------------------------------------- #
+        # STEP 2: MISO — load and wind forecasts
+        # ---------------------------------------------------------------- #
+        logger.info("\n[2/5] Fetching MISO load/wind forecasts...")
+        miso_result = self.miso.fetch_data()
+
+        if miso_result["success"]:
+            load_forecast = miso_result.get("load_forecast", [])
+            wind_forecast = miso_result.get("wind_forecast", [])
+            logger.info(f"✅ MISO OK: load={len(load_forecast)}h, wind={len(wind_forecast)}h")
+        else:
+            logger.warning("⚠️  MISO fetch failed — using synthetic load/wind shape")
+            load_forecast = []
+            wind_forecast = []
+
+        # Fill gaps with synthetic shapes
+        if len(load_forecast) < 24:
+            logger.info("   Using synthetic MISO spring load shape")
+            load_forecast = list(SYNTHETIC_LOAD)
+        if len(wind_forecast) < 24:
+            logger.info("   Using synthetic MISO spring wind shape")
+            wind_forecast = list(SYNTHETIC_WIND)
+
+        load_forecast = load_forecast[:24]
+        wind_forecast = wind_forecast[:24]
+
+        logger.info(f"   Load avg: {sum(load_forecast)/len(load_forecast):.1f} GW  "
+                    f"range: {min(load_forecast):.0f}–{max(load_forecast):.0f} GW")
+        logger.info(f"   Wind avg: {sum(wind_forecast)/len(wind_forecast):.1f} GW  "
+                    f"range: {min(wind_forecast):.0f}–{max(wind_forecast):.0f} GW")
+
+        # ---------------------------------------------------------------- #
+        # STEP 3: Claude expert refinement
+        # ---------------------------------------------------------------- #
+        logger.info("\n[3/5] Claude expert refinement...")
         claude_result = self.refiner.claude_refine(
             base_prices,
             load_forecast,
-            wind_forecast
+            wind_forecast,
+            target_date=tomorrow,
         )
-        
-        if claude_result['success']:
-            refined_prices = claude_result['refined_prices']
-            logger.info(f"✅ Claude refinement complete")
-            logger.info(f"   Reasoning: {claude_result.get('reasoning', 'N/A')[:100]}...")
+
+        if claude_result["success"]:
+            refined_prices = claude_result["refined_prices"]
+            clamped = claude_result.get("clamped_hours", 0)
+            logger.info(f"✅ Claude OK | clamped_hours={clamped}")
+            logger.info(f"   Reasoning: {claude_result.get('reasoning', '')}")
+            # Log before/after comparison
+            diffs = [round(refined_prices[i] - base_prices[i], 2) for i in range(24)]
+            logger.info(f"   Hour-by-hour delta: {diffs}")
         else:
-            logger.warning(f"⚠️ Claude refinement failed: {claude_result.get('error')}")
-            refined_prices = base_prices
-        
+            logger.warning(f"⚠️  Claude failed: {claude_result.get('error')} — using base prices")
+            refined_prices = list(base_prices)
+
+        # ---------------------------------------------------------------- #
         # STEP 4: Gemini validation
-        logger.info("\n[4/6] Validating with Gemini AI...")
-        
+        # ---------------------------------------------------------------- #
+        logger.info("\n[4/5] Gemini validation...")
         gemini_result = self.refiner.gemini_validate(
             refined_prices,
-            load_forecast,
-            wind_forecast
-        )
-        
-        if gemini_result['success']:
-            if gemini_result['validation_passed']:
-                logger.info("✅ Gemini validation passed")
-            else:
-                logger.warning(f"⚠️ Gemini concerns: {gemini_result.get('concerns', '')[:100]}...")
-        else:
-            logger.warning(f"⚠️ Gemini validation failed (non-critical)")
-        
-        # STEP 5: Merge results
-        logger.info("\n[5/6] Merging results...")
-        
-        final_prices = self.refiner.merge_results(
             base_prices,
-            refined_prices,
-            gemini_result
+            load_forecast,
+            wind_forecast,
         )
-        
-        logger.info(f"✅ Final prices generated: {len(final_prices)} hours")
-        logger.info(f"   Range: ${min(final_prices):.2f} - ${max(final_prices):.2f}")
-        logger.info(f"   Average: ${sum(final_prices)/len(final_prices):.2f}")
-        
-        # STEP 6: Send via WhatsApp
-        logger.info("\n[6/6] Sending via WhatsApp...")
 
-        if not self.sender.available:
-            logger.warning("⚠️ Twilio credentials not configured, skipping WhatsApp send")
+        if gemini_result["success"]:
+            passed = gemini_result["validation_passed"]
+            flagged = gemini_result.get("flagged_hours", [])
+            logger.info(f"✅ Gemini OK | passed={passed} | flagged_hours={flagged}")
         else:
-            metadata = self.sender.calculate_metadata(final_prices)
+            logger.warning(f"⚠️  Gemini failed (non-critical): {gemini_result.get('error')}")
 
-            stepdad_sent = self.sender.send_to_stepdad(final_prices)
-            if stepdad_sent:
-                logger.info("✅ WhatsApp sent to stepdad")
-            else:
-                logger.warning("⚠️ Failed to send WhatsApp to stepdad")
+        # ---------------------------------------------------------------- #
+        # STEP 5: Merge
+        # ---------------------------------------------------------------- #
+        logger.info("\n[5/5] Merging results...")
+        final_prices = self.refiner.merge_results(base_prices, refined_prices, gemini_result)
 
-            you_sent = self.sender.send_to_you(final_prices, metadata)
-            if you_sent:
-                logger.info("✅ WhatsApp sent to you (monitoring)")
-            else:
-                logger.warning("⚠️ Failed to send WhatsApp to you")
-
-        logger.info("\n" + "="*60)
+        logger.info(f"✅ Final prices: {len(final_prices)} hours")
+        logger.info(f"   Range: ${min(final_prices):.2f} – ${max(final_prices):.2f}")
+        logger.info(f"   Avg:   ${sum(final_prices)/len(final_prices):.2f}")
+        logger.info(f"   Final: {final_prices}")
+        logger.info("\n" + "=" * 60)
         logger.info("✅ FORECAST PIPELINE COMPLETE")
-        logger.info("="*60 + "\n")
+        logger.info("=" * 60 + "\n")
 
         return final_prices
-    
-    def start_scheduler(self):
-        """Start the APScheduler to run forecasts daily at 7:00 AM"""
-        self.scheduler = BackgroundScheduler()
-        # Schedule forecast to run every day at 7:00 AM
-        self.scheduler.add_job(
-            self.run_forecast,
-            'cron',
-            hour=7,
-            minute=0,
-            id='daily_forecast'
+
+    # ------------------------------------------------------------------ #
+    # WhatsApp delivery (separate from pipeline so callers control it)
+    # ------------------------------------------------------------------ #
+    def send_whatsapp(self, final_prices: list) -> dict:
+        """Send forecast via WhatsApp. Returns {stepdad_ok, you_ok, errors}."""
+        if not self.sender.available:
+            logger.warning("⚠️  Twilio credentials not configured — skipping WhatsApp send")
+            return {"stepdad_ok": False, "you_ok": False, "errors": ["Twilio not configured"]}
+
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%B %d, %Y")
+        meta = self.sender.calculate_metadata(final_prices)
+
+        stepdad_ok, stepdad_err = self.sender.send_to_stepdad(
+            tomorrow, final_prices, meta["avg"], meta["min_price"], meta["max_price"]
         )
-        
-        self.scheduler.start()
-        logger.info("✅ Scheduler started - forecast will run daily at 7:00 AM")
-        logger.info(f"   Next run: {self.scheduler.get_job('daily_forecast').next_run_time}")
-        
-        # Shut down the scheduler when exiting the app
-        atexit.register(lambda: self.scheduler.shutdown())
-    
-    def run_once(self):
-        """Run forecast once immediately (for testing)"""
-        logger.info("Running forecast immediately (testing mode)...")
-        return self.run_forecast()
+        if stepdad_ok:
+            logger.info("✅ WhatsApp sent to stepdad")
+        else:
+            logger.error(f"❌ WhatsApp to stepdad FAILED: {stepdad_err}")
+
+        you_ok, you_err = self.sender.send_to_you(
+            tomorrow, final_prices, meta["avg"], meta["min_price"], meta["max_price"], meta
+        )
+        if you_ok:
+            logger.info("✅ WhatsApp sent to monitoring number")
+        else:
+            logger.warning(f"⚠️  WhatsApp to monitoring failed: {you_err}")
+
+        errors = []
+        if stepdad_err:
+            errors.append(f"stepdad: {stepdad_err}")
+        if you_err:
+            errors.append(f"monitor: {you_err}")
+
+        return {"stepdad_ok": stepdad_ok, "you_ok": you_ok, "errors": errors}
+
+    # ------------------------------------------------------------------ #
+    # Local testing entry point
+    # ------------------------------------------------------------------ #
+    def run_once(self) -> list:
+        """Run pipeline + send (used for local testing only)."""
+        prices = self.run_forecast()
+        if prices:
+            self.send_whatsapp(prices)
+        return prices
+
 
 def main():
-    """Main entry point"""
-    
     logger.info("DA-LMP FORECAST BOT STARTING")
     logger.info(f"Time: {datetime.now()}")
-    
-    # Check environment variables
-    required_vars = [
-        'CLAUDE_API_KEY',
-    ]
-    
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
-    if missing_vars:
-        logger.error(f"Missing required environment variables: {missing_vars}")
+
+    missing = [v for v in ["CLAUDE_API_KEY"] if not os.getenv(v)]
+    if missing:
+        logger.error(f"Missing required env vars: {missing}")
         return False
-    
-    # Initialize bot
+
     bot = ForecastBot()
-    
-    # Run once for testing
-    logger.info("\n--- RUNNING FIRST FORECAST TEST ---\n")
-    success = bot.run_once()
-    
-    if success is not False:
-        logger.info("\n--- FIRST FORECAST SUCCESSFUL ---")
-        logger.info("Starting scheduler for daily forecasts...\n")
-        bot.start_scheduler()
+    logger.info("\n--- RUNNING FORECAST TEST ---\n")
+    prices = bot.run_once()
 
-        # Keep scheduler running
-        try:
-            while True:
-                pass
-        except KeyboardInterrupt:
-            logger.info("Shutting down...")
+    if prices:
+        logger.info("--- FORECAST SUCCESSFUL ---")
     else:
-        logger.error("First forecast failed, not starting scheduler")
+        logger.error("Forecast failed")
         return False
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
