@@ -57,14 +57,26 @@ class AIRefiner:
         load_forecast: List[float],
         wind_forecast: List[float],
         target_date: Optional[str] = None,
+        trader_context: Optional[Dict] = None,
     ) -> Dict:
         """
         Use Claude with expert MISO trading methodology to fine-tune prices.
 
         Key principle: base prices are already grounded in ~40 days of historical
-        data from fantods.  Claude's job is FINE-TUNING based on the load/wind
-        shape, not wholesale repricing.  Adjustments are hard-capped per period.
+        data from fantods.  Claude's job is FINE-TUNING based on load/wind shape,
+        weather, gas prices, historical weekday patterns, and calendar context.
+        Adjustments are hard-capped per period.
+
+        trader_context keys (all optional):
+          weather      - from WeatherScraper.fetch_data()
+          gas          - from GasPricesScraper.fetch_data()
+          history_summary - str from HistoricalPatterns.summary_for_date()
+          history_profile - list[float] 24-h same-weekday avg prices
+          calendar     - str from calendar_data.demand_profile_label()
+          daylight_hrs - float
+          load_factor  - float (calendar load adjustment factor)
         """
+        ctx = trader_context or {}
         try:
             avg_load = sum(load_forecast) / len(load_forecast) if load_forecast else 100.0
             avg_wind = sum(wind_forecast) / len(wind_forecast) if wind_forecast else 10.0
@@ -82,62 +94,125 @@ class AIRefiner:
                 except Exception:
                     pass
 
-            # Per-hour context table
+            # Build per-hour context table
+            hist_profile = ctx.get("history_profile", [])
             rows = []
             for h in range(24):
                 hr = h + 1
                 period = get_period(hr)
                 cap = MAX_CAPS[period]
                 load_pct = (load_forecast[h] / avg_load * 100) if avg_load else 100
+                hist_col = f"  hist=${hist_profile[h]:5.1f}" if hist_profile else ""
                 rows.append(
                     f"  hr{hr:02d} [{period:>13s}] "
-                    f"base=${base_prices[h]:6.2f}  "
+                    f"base=${base_prices[h]:6.2f}{hist_col}  "
                     f"load={load_forecast[h]:6.0f}GW({load_pct:3.0f}%)  "
                     f"wind={wind_forecast[h]:5.1f}GW  "
                     f"max_adj=±{cap*100:.0f}%"
                 )
 
+            # Build trader context block
+            ctx_lines = []
+
+            weather = ctx.get("weather", {})
+            if weather.get("success"):
+                ctx_lines.append(f"WEATHER (Chicago MISO load center): {weather.get('summary', '')}")
+                ctx_lines.append(f"  Trader read: {weather.get('trading_signal', '')}")
+                hourly_w = weather.get("hourly", [])
+                if hourly_w:
+                    from src.scrapers.weather_scraper import heating_degree_hours, cooling_degree_hours
+                    hdh = heating_degree_hours(hourly_w)
+                    cdh = cooling_degree_hours(hourly_w)
+                    if hdh > 100:
+                        ctx_lines.append(f"  Heating degree-hours: {hdh:.0f} HDD → material heating load")
+                    elif cdh > 100:
+                        ctx_lines.append(f"  Cooling degree-hours: {cdh:.0f} CDD → material cooling load")
+                    else:
+                        ctx_lines.append(f"  HVAC demand: minimal (comfort range)")
+            else:
+                ctx_lines.append("WEATHER: unavailable — assume seasonal normal")
+
+            gas = ctx.get("gas", {})
+            if gas.get("success"):
+                ctx_lines.append(f"NATURAL GAS (Henry Hub): {gas.get('trading_signal', '')}")
+                lmp_impact = gas.get("lmp_impact_pct", 0)
+                if abs(lmp_impact) >= 4:
+                    ctx_lines.append(f"  LMP impact: {lmp_impact:+.0f}% vs baseline (material — factor into adjustments)")
+            else:
+                ctx_lines.append("NATURAL GAS: unavailable — assume moderate prices, no unusual pressure")
+
+            hist_summary = ctx.get("history_summary", "")
+            if hist_summary:
+                ctx_lines.append(f"SAME-WEEKDAY HISTORY: {hist_summary}")
+                if hist_profile:
+                    hist_avg = sum(hist_profile) / len(hist_profile)
+                    base_avg = sum(base_prices) / len(base_prices)
+                    diff = hist_avg - base_avg
+                    if abs(diff) > 2:
+                        ctx_lines.append(
+                            f"  Hist avg ${hist_avg:.1f} vs base avg ${base_avg:.1f} "
+                            f"(${diff:+.1f} — {'hist is higher, cautious upward lean' if diff > 0 else 'hist is lower, cautious downward lean'})"
+                        )
+
+            cal = ctx.get("calendar", "")
+            dl = ctx.get("daylight_hrs", 0)
+            lf = ctx.get("load_factor", 1.0)
+            if cal:
+                ctx_lines.append(f"CALENDAR: {cal}")
+            if dl:
+                ctx_lines.append(f"  Daylight: {dl}h  |  Load factor vs normal weekday: {lf:.2f}x")
+
+            ctx_block = "\n".join(ctx_lines) if ctx_lines else "No additional trader context available."
+
             prompt = f"""You are a veteran MISO energy market trader with decades of DA-LMP forecasting experience.
 
 FORECAST TARGET
   Date   : {target_date or 'tomorrow'} ({dow})
-  Season : {month_name} — spring shoulder season (low heating AND low cooling load vs. winter/summer)
-  Weekend: {'YES → lower industrial/commercial load, expect softer prices overall' if is_weekend else 'NO → normal weekday load profile'}
-  Avg system load : {avg_load:.0f} GW
-  Avg wind output : {avg_wind:.1f} GW
+  Season : {month_name}
+  Weekend: {'YES' if is_weekend else 'NO'}
+  Avg system load : {avg_load:.0f} GW  |  Avg wind output : {avg_wind:.1f} GW
 
-HOURLY DATA (base prices = ~40-day rolling historical mean from fantods)
+═══ TRADER CONTEXT ════════════════════════════════════════════════════
+{ctx_block}
+═══════════════════════════════════════════════════════════════════════
+
+HOURLY DATA  (base = ~40-day fantods rolling mean | hist = same-weekday avg)
 {chr(10).join(rows)}
 
 YOUR JOB — FINE-TUNE, DO NOT REPRICE
-The base prices already reflect history.  Errors of $15-20/MWh have occurred when
-adjustments were too aggressive.  Apply these trading rules with discipline:
+The base prices already reflect history.  Past errors of $15-20/MWh occurred when
+adjustments were too aggressive.  Apply these rules with discipline:
 
-RULE 1 — DEMAND SIGNAL (per hour vs. daily avg load)
-  Load > 110 % of avg  →  small positive adj  (demand pressure)
-  Load  90–110 % of avg →  near-zero adj       (balanced)
-  Load < 90 % of avg   →  small negative adj  (surplus supply)
+RULE 1 — DEMAND SIGNAL (hour load vs daily avg)
+  Load > 110% avg  → small positive adj  |  Load < 90% avg  → small negative adj
 
-RULE 2 — WIND SIGNAL (merit-order suppression)
-  Wind > 15 GW  →  slight negative adj  (cheap wind displaces gas)
-  Wind  8–15 GW →  near-zero
-  Wind <  8 GW  →  slight positive adj  (more thermal dispatch)
+RULE 2 — WIND MERIT-ORDER
+  Wind > 15 GW → slight negative  |  Wind < 8 GW → slight positive
 
-RULE 3 — SPRING DISCOUNT
-  April/May shoulder season = lower overall demand.  When in doubt, lean slightly
-  negative.  Do NOT push prices upward without clear load/wind justification.
+RULE 3 — GAS PRICE SIGNAL
+  If gas lmp_impact ≥ +4% → allow slightly larger positive adj within cap
+  If gas lmp_impact ≤ -5% → lean negative
 
-RULE 4 — WEEKEND DISCOUNT (if weekend)
-  Add −0.5 % to every hour on top of other adjustments.
+RULE 4 — WEATHER SIGNAL
+  Cold (HDH > 100) → upward lean on morning/evening hours
+  Hot (CDH > 100) → upward lean on afternoon hours
+  Mild → lean flat or slightly negative
 
-RULE 5 — NIGHT FLOOR (hours 1-6)
-  Night prices rarely exceed $28 in MISO spring.  Clamp night adjustments near zero
-  unless load is unusually high.
+RULE 5 — HISTORICAL ANCHOR
+  If same-weekday history average differs significantly from base:
+  lean adjustments toward history, but STAY WITHIN CAPS
 
-RULE 6 — CAPS ARE HARD LIMITS
-  The max_adj column shows the absolute cap for each period.
-  NEVER exceed it.  A +5 % adjustment on a $40 base = $2 error (acceptable).
-  A +15 % adjustment = $6 error (unacceptable).  Stay within caps.
+RULE 6 — WEEKEND/HOLIDAY
+  Weekend or holiday → add −0.5% to −1% across all hours
+
+RULE 7 — SEASON
+  Spring/fall shoulder → lean slightly negative unless demand signals say otherwise
+  Summer/winter → base prices may understate demand pressure
+
+RULE 8 — CAPS ARE ABSOLUTE HARD LIMITS
+  Night (1-6): ±1%  |  Morning ramp (7-9): ±2%  |  Midday (10-15): ±2%
+  Shoulder (16-19): ±2%  |  Evening peak (20-24): ±3%
+  NEVER exceed. A $40 base × 3% cap = max $1.20 adjustment.
 
 RESPOND ONLY with valid JSON (no markdown fences, no extra text):
 {{
@@ -167,7 +242,7 @@ RESPOND ONLY with valid JSON (no markdown fences, no extra text):
     "23": <float>,
     "24": <float>
   }},
-  "reasoning": "2-3 sentences covering load shape, wind signal, and any seasonal or weekend factors you applied"
+  "reasoning": "3-4 sentences covering weather, gas price, historical anchor, and any demand/wind signal that drove your adjustments"
 }}"""
 
             response = self.claude_client.messages.create(

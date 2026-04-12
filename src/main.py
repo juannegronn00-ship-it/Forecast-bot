@@ -1,10 +1,19 @@
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 
 from src.scrapers.fantods_scraper import FantodsScraperr
 from src.scrapers.miso_scraper import MISOScraper
+from src.scrapers.weather_scraper import WeatherScraper
+from src.scrapers.gas_prices_scraper import GasPricesScraper
+from src.data.historical_patterns import HistoricalPatterns
+from src.data.calendar_data import (
+    demand_profile_label,
+    daylight_hours,
+    load_adjustment_factor,
+    solar_generation_signal,
+)
 from src.utils.matcher import HourMatcher
 from src.ai.refinement import AIRefiner
 from src.utils.whatsapp_sender import WhatsAppSender
@@ -21,7 +30,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Typical MISO spring load shape (GW) — used when all scrapers fail
+# ─── Synthetic fallbacks (used when all scrapers fail) ──────────────────────
+# Typical MISO spring load shape (GW)
 SYNTHETIC_LOAD = [
     88, 85, 83, 82, 83, 86, 92, 100, 105, 107, 108, 108,
     107, 106, 106, 107, 110, 114, 116, 114, 111, 106, 99, 93,
@@ -31,7 +41,7 @@ SYNTHETIC_WIND = [
     12, 13, 14, 14, 13, 12, 10, 9, 8, 8, 9, 10,
     11, 12, 12, 11, 10, 9, 9, 10, 11, 12, 12, 12,
 ]
-# Typical MISO spring DA-LMP shape ($/MWh) — fallback if fantods fails
+# Typical MISO spring DA-LMP shape ($/MWh)
 SYNTHETIC_PRICES = [
     22, 21, 20, 20, 21, 23, 28, 35, 38, 36, 34, 33,
     32, 31, 32, 34, 37, 42, 45, 43, 40, 36, 30, 25,
@@ -39,7 +49,19 @@ SYNTHETIC_PRICES = [
 
 
 class ForecastBot:
-    """Orchestrates the full DA-LMP forecasting pipeline."""
+    """
+    Orchestrates the full DA-LMP forecasting pipeline.
+
+    Steps:
+      1. Fantods  — base DA-LMP prices (40-day rolling mean)
+      2. MISO     — load/wind system forecasts
+      3. Weather  — Chicago temp, wind, cloud cover (NOAA primary)
+      4. Gas      — Henry Hub spot price (EIA API or seasonal estimate)
+      5. History  — same-weekday patterns from fantods price history
+      6. Claude   — expert trading refinement with full context
+      7. Gemini   — validation + surgical rollbacks
+      8. Merge    — final 24-hour price array
+    """
 
     def __init__(self):
         required = {"CLAUDE_API_KEY": os.getenv("CLAUDE_API_KEY")}
@@ -49,108 +71,140 @@ class ForecastBot:
 
         self.fantods = FantodsScraperr()
         self.miso = MISOScraper()
+        self.weather = WeatherScraper()
+        self.gas = GasPricesScraper()
+        self.history = HistoricalPatterns()
         self.matcher = HourMatcher()
         self.refiner = AIRefiner()
         self.sender = WhatsAppSender()
 
-    # ------------------------------------------------------------------ #
-    # Core pipeline  (does NOT send WhatsApp — callers handle that)
-    # ------------------------------------------------------------------ #
+    # ────────────────────────────────────────────────────────────────────
+    # Core pipeline  (returns prices, does NOT send WhatsApp)
+    # ────────────────────────────────────────────────────────────────────
     def run_forecast(self) -> list:
-        """
-        Execute forecast pipeline and return 24 final prices.
-        WhatsApp delivery is intentionally NOT done here — the caller
-        (api/index.py or run_once) is responsible, so we never double-send.
+        """Execute forecast and return 24 final prices."""
+        logger.info("=" * 65)
+        logger.info("STARTING DA-LMP FORECAST PIPELINE")
+        tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%B %d, %Y")
+        tomorrow_date = date.today() + timedelta(days=1)
+        logger.info(f"Forecasting for: {tomorrow_str}")
+        logger.info("=" * 65)
 
-        Steps:
-          1. Scrape fantods for DA-LMP base prices
-          2. Fetch MISO load/wind forecasts
-          3. Claude expert refinement (capped adjustments)
-          4. Gemini validation + surgical corrections
-          5. Merge and return final prices
-        """
-        logger.info("=" * 60)
-        logger.info("STARTING FORECAST PIPELINE")
-        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%B %d, %Y")
-        logger.info(f"Forecasting for: {tomorrow}")
-        logger.info("=" * 60)
-
-        # ---------------------------------------------------------------- #
-        # STEP 1: Fantods — base DA-LMP prices
-        # ---------------------------------------------------------------- #
-        logger.info("\n[1/5] Scraping fantods for DA-LMP base prices...")
+        # ── STEP 1: Fantods base prices ──────────────────────────────────
+        logger.info("\n[1/8] Fantods — base DA-LMP prices...")
         fantods_result = self.fantods.scrape_data()
 
         if fantods_result["success"]:
             base_prices = fantods_result["prices_by_hour"]
-            logger.info(f"✅ Fantods OK: {len(base_prices)} prices, avg=${sum(base_prices)/len(base_prices):.2f}")
+            logger.info(f"✅ Fantods: {len(base_prices)} prices, avg=${sum(base_prices)/len(base_prices):.2f}")
         else:
-            logger.warning(f"⚠️  Fantods failed: {fantods_result.get('error')} — using synthetic prices")
+            logger.warning(f"⚠️  Fantods failed: {fantods_result.get('error')} — using synthetic")
             base_prices = list(SYNTHETIC_PRICES)
 
-        # Pad/trim to exactly 24
         while len(base_prices) < 24:
             base_prices.append(base_prices[-1] if base_prices else 30.0)
         base_prices = base_prices[:24]
 
-        # ---------------------------------------------------------------- #
-        # STEP 2: MISO — load and wind forecasts
-        # ---------------------------------------------------------------- #
-        logger.info("\n[2/5] Fetching MISO load/wind forecasts...")
+        # ── STEP 2: MISO load/wind forecasts ────────────────────────────
+        logger.info("\n[2/8] MISO — system load/wind forecasts...")
         miso_result = self.miso.fetch_data()
 
         if miso_result["success"]:
             load_forecast = miso_result.get("load_forecast", [])
             wind_forecast = miso_result.get("wind_forecast", [])
-            logger.info(f"✅ MISO OK: load={len(load_forecast)}h, wind={len(wind_forecast)}h")
+            logger.info(f"✅ MISO: load={len(load_forecast)}h, wind={len(wind_forecast)}h")
         else:
-            logger.warning("⚠️  MISO fetch failed — using synthetic load/wind shape")
-            load_forecast = []
-            wind_forecast = []
+            logger.warning("⚠️  MISO failed — using synthetic shapes")
+            load_forecast, wind_forecast = [], []
 
-        # Fill gaps with synthetic shapes
         if len(load_forecast) < 24:
-            logger.info("   Using synthetic MISO spring load shape")
             load_forecast = list(SYNTHETIC_LOAD)
         if len(wind_forecast) < 24:
-            logger.info("   Using synthetic MISO spring wind shape")
             wind_forecast = list(SYNTHETIC_WIND)
 
         load_forecast = load_forecast[:24]
         wind_forecast = wind_forecast[:24]
+        logger.info(
+            f"   Load: avg={sum(load_forecast)/24:.1f} GW, "
+            f"range={min(load_forecast):.0f}–{max(load_forecast):.0f} GW"
+        )
+        logger.info(
+            f"   Wind: avg={sum(wind_forecast)/24:.1f} GW, "
+            f"range={min(wind_forecast):.0f}–{max(wind_forecast):.0f} GW"
+        )
 
-        logger.info(f"   Load avg: {sum(load_forecast)/len(load_forecast):.1f} GW  "
-                    f"range: {min(load_forecast):.0f}–{max(load_forecast):.0f} GW")
-        logger.info(f"   Wind avg: {sum(wind_forecast)/len(wind_forecast):.1f} GW  "
-                    f"range: {min(wind_forecast):.0f}–{max(wind_forecast):.0f} GW")
+        # ── STEP 3: Weather ──────────────────────────────────────────────
+        logger.info("\n[3/8] Weather — Chicago MISO load center...")
+        weather_result = self.weather.fetch_data()
+        if weather_result.get("success"):
+            logger.info(f"✅ Weather ({weather_result['source']}): {weather_result['summary']}")
+            logger.info(f"   Signal: {weather_result['trading_signal']}")
+        else:
+            logger.warning("⚠️  Weather fetch failed — no weather context for Claude")
 
-        # ---------------------------------------------------------------- #
-        # STEP 3: Claude expert refinement
-        # ---------------------------------------------------------------- #
-        logger.info("\n[3/5] Claude expert refinement...")
+        # ── STEP 4: Gas prices ───────────────────────────────────────────
+        logger.info("\n[4/8] Gas prices — Henry Hub...")
+        gas_result = self.gas.fetch_data()
+        if gas_result.get("success"):
+            logger.info(f"✅ Gas ({gas_result['source']}): {gas_result['trading_signal']}")
+        else:
+            logger.warning("⚠️  Gas price fetch failed")
+
+        # ── STEP 5: Historical same-weekday patterns ─────────────────────
+        logger.info("\n[5/8] Historical patterns — same weekday analysis...")
+        self.history.load()
+        hist_summary = ""
+        hist_profile = []
+        if self.history.loaded:
+            hist_summary = self.history.summary_for_date(tomorrow_date)
+            hist_profile = self.history.get_weekday_profile(tomorrow_date.weekday())
+            logger.info(f"✅ History: {hist_summary}")
+        else:
+            logger.warning("⚠️  Historical patterns unavailable")
+
+        # ── STEP 6: Calendar context ─────────────────────────────────────
+        logger.info("\n[6/8] Calendar context...")
+        cal_label = demand_profile_label(tomorrow_date)
+        dl_hours = daylight_hours(tomorrow_date)
+        lf = load_adjustment_factor(tomorrow_date)
+        solar_signal = solar_generation_signal(tomorrow_date)
+        logger.info(f"   {cal_label}")
+        logger.info(f"   {solar_signal}  |  load_factor={lf:.3f}")
+
+        # ── STEP 7: Claude expert refinement ────────────────────────────
+        logger.info("\n[7/8] Claude expert refinement (full trader context)...")
+
+        trader_context = {
+            "weather": weather_result,
+            "gas": gas_result,
+            "history_summary": hist_summary,
+            "history_profile": hist_profile,
+            "calendar": cal_label,
+            "daylight_hrs": dl_hours,
+            "load_factor": lf,
+        }
+
         claude_result = self.refiner.claude_refine(
             base_prices,
             load_forecast,
             wind_forecast,
-            target_date=tomorrow,
+            target_date=tomorrow_str,
+            trader_context=trader_context,
         )
 
         if claude_result["success"]:
             refined_prices = claude_result["refined_prices"]
             clamped = claude_result.get("clamped_hours", 0)
-            logger.info(f"✅ Claude OK | clamped_hours={clamped}")
+            logger.info(f"✅ Claude: clamped_hours={clamped}")
             logger.info(f"   Reasoning: {claude_result.get('reasoning', '')}")
-            # Log before/after comparison
             diffs = [round(refined_prices[i] - base_prices[i], 2) for i in range(24)]
-            logger.info(f"   Hour-by-hour delta: {diffs}")
+            logger.info(f"   Deltas: {diffs}")
         else:
             logger.warning(f"⚠️  Claude failed: {claude_result.get('error')} — using base prices")
             refined_prices = list(base_prices)
 
-        # ---------------------------------------------------------------- #
-        # STEP 4: Gemini validation
-        # ---------------------------------------------------------------- #
-        logger.info("\n[4/5] Gemini validation...")
+        # ── STEP 8: Gemini validation ────────────────────────────────────
+        logger.info("\n[8/8] Gemini validation...")
         gemini_result = self.refiner.gemini_validate(
             refined_prices,
             base_prices,
@@ -159,31 +213,27 @@ class ForecastBot:
         )
 
         if gemini_result["success"]:
-            passed = gemini_result["validation_passed"]
-            flagged = gemini_result.get("flagged_hours", [])
-            logger.info(f"✅ Gemini OK | passed={passed} | flagged_hours={flagged}")
+            logger.info(
+                f"✅ Gemini: passed={gemini_result['validation_passed']} "
+                f"| flagged={gemini_result.get('flagged_hours', [])}"
+            )
         else:
             logger.warning(f"⚠️  Gemini failed (non-critical): {gemini_result.get('error')}")
 
-        # ---------------------------------------------------------------- #
-        # STEP 5: Merge
-        # ---------------------------------------------------------------- #
-        logger.info("\n[5/5] Merging results...")
+        # ── Merge ────────────────────────────────────────────────────────
         final_prices = self.refiner.merge_results(base_prices, refined_prices, gemini_result)
 
-        logger.info(f"✅ Final prices: {len(final_prices)} hours")
+        logger.info(f"\n✅ PIPELINE COMPLETE for {tomorrow_str}")
         logger.info(f"   Range: ${min(final_prices):.2f} – ${max(final_prices):.2f}")
-        logger.info(f"   Avg:   ${sum(final_prices)/len(final_prices):.2f}")
+        logger.info(f"   Avg:   ${sum(final_prices)/24:.2f}")
         logger.info(f"   Final: {final_prices}")
-        logger.info("\n" + "=" * 60)
-        logger.info("✅ FORECAST PIPELINE COMPLETE")
-        logger.info("=" * 60 + "\n")
+        logger.info("=" * 65 + "\n")
 
         return final_prices
 
-    # ------------------------------------------------------------------ #
-    # WhatsApp delivery (separate from pipeline so callers control it)
-    # ------------------------------------------------------------------ #
+    # ────────────────────────────────────────────────────────────────────
+    # WhatsApp delivery
+    # ────────────────────────────────────────────────────────────────────
     def send_whatsapp(self, final_prices: list) -> dict:
         """Send forecast via WhatsApp. Returns {stepdad_ok, you_ok, errors}."""
         if not self.sender.available:
@@ -209,17 +259,16 @@ class ForecastBot:
         else:
             logger.warning(f"⚠️  WhatsApp to monitoring failed: {you_err}")
 
-        errors = []
-        if stepdad_err:
-            errors.append(f"stepdad: {stepdad_err}")
-        if you_err:
-            errors.append(f"monitor: {you_err}")
+        errors = [e for e in [
+            f"stepdad: {stepdad_err}" if stepdad_err else None,
+            f"monitor: {you_err}" if you_err else None,
+        ] if e]
 
         return {"stepdad_ok": stepdad_ok, "you_ok": you_ok, "errors": errors}
 
-    # ------------------------------------------------------------------ #
+    # ────────────────────────────────────────────────────────────────────
     # Local testing entry point
-    # ------------------------------------------------------------------ #
+    # ────────────────────────────────────────────────────────────────────
     def run_once(self) -> list:
         """Run pipeline + send (used for local testing only)."""
         prices = self.run_forecast()
