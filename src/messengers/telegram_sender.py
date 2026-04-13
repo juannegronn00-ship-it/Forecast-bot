@@ -51,6 +51,7 @@ class TelegramSender:
         self.token = os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.stepdad_chat_id = os.getenv("TELEGRAM_STEPDAD_CHAT_ID", "")
         self.your_chat_id = os.getenv("TELEGRAM_YOUR_CHAT_ID", "")
+        self._sent_this_run: set = set()  # dedup guard: track chat_ids sent in this process
 
     @property
     def available(self) -> bool:
@@ -111,42 +112,56 @@ class TelegramSender:
     # ------------------------------------------------------------------ #
     # Send helpers
     # ------------------------------------------------------------------ #
-    def send(self, chat_id: str, message: str) -> tuple:
-        """Send message to a single chat ID. Returns (success, error_or_None)."""
+    def _send_once(self, chat_id: str, message: str, label: str) -> tuple:
+        """
+        Send to a single chat ID, skipping if already sent to this ID in the
+        current process (prevents double-sends from retries or misconfiguration).
+        Returns (success, error_or_None).
+        """
         if not self.available:
             return False, "TELEGRAM_BOT_TOKEN not set"
         if not chat_id:
-            return False, "chat_id not provided"
+            return False, f"{label} chat_id not configured"
+        if chat_id in self._sent_this_run:
+            logger.warning(f"⚠️  Skipping duplicate send to {label} (chat_id={chat_id} already sent this run)")
+            return True, None   # treat as success — message already delivered
         try:
             _api(self.token, "sendMessage", {
                 "chat_id": chat_id,
                 "text": message,
                 "parse_mode": "HTML",
             })
-            logger.info(f"Telegram sent to chat_id={chat_id}")
+            self._sent_this_run.add(chat_id)
+            logger.info(f"Telegram sent to {label} (chat_id={chat_id})")
             return True, None
         except Exception as e:
-            logger.error(f"Telegram send to {chat_id} failed: {e}")
+            logger.error(f"Telegram send to {label} ({chat_id}) failed: {e}")
             return False, str(e)
 
-    def send_forecast(
-        self,
-        date_str: str,
-        prices: List[float],
-    ) -> Dict:
+    def send_to_stepdad(self, message: str) -> tuple:
+        """Send to TELEGRAM_STEPDAD_CHAT_ID. Returns (success, error_or_None)."""
+        return self._send_once(self.stepdad_chat_id, message, "stepdad")
+
+    def send_to_you(self, message: str) -> tuple:
+        """Send to TELEGRAM_YOUR_CHAT_ID. Returns (success, error_or_None)."""
+        return self._send_once(self.your_chat_id, message, "monitor")
+
+    def send_forecast(self, date_str: str, prices: List[float]) -> Dict:
         """
-        Send forecast to both stepdad and monitoring chat IDs.
+        Send forecast to stepdad then to monitoring.
+        Each recipient receives exactly one message per run — duplicate
+        chat IDs or retry calls are silently skipped by _send_once().
         Returns {stepdad_ok, you_ok, errors}.
         """
         message = self.format_message(date_str, prices)
 
-        stepdad_ok, stepdad_err = self.send(self.stepdad_chat_id, message)
+        stepdad_ok, stepdad_err = self.send_to_stepdad(message)
         if stepdad_ok:
             logger.info("✅ Telegram forecast sent to stepdad")
         else:
             logger.error(f"❌ Telegram to stepdad FAILED: {stepdad_err}")
 
-        you_ok, you_err = self.send(self.your_chat_id, message)
+        you_ok, you_err = self.send_to_you(message)
         if you_ok:
             logger.info("✅ Telegram forecast sent to monitoring")
         else:
