@@ -54,24 +54,24 @@ class handler(BaseHTTPRequestHandler):
             avg = sum(final_prices) / len(final_prices)
             logger.info(f"Pipeline complete | avg=${avg:.2f} | range=${min(final_prices):.2f}–${max(final_prices):.2f}")
 
-            # Step 2: send WhatsApp (single send — no duplicate)
-            wa_result = bot.send_whatsapp(final_prices)
-            stepdad_ok = wa_result.get("stepdad_ok", False)
-            you_ok = wa_result.get("you_ok", False)
-            wa_errors = wa_result.get("errors", [])
+            # Step 2: send via Telegram
+            tg_result = bot.send_telegram(final_prices)
+            stepdad_ok = tg_result.get("stepdad_ok", False)
+            you_ok = tg_result.get("you_ok", False)
+            tg_errors = tg_result.get("errors", [])
 
             if stepdad_ok:
-                logger.info(f"✅ WhatsApp delivered to stepdad for {tomorrow}")
+                logger.info(f"✅ Telegram delivered to stepdad for {tomorrow}")
             else:
-                logger.error(f"❌ WhatsApp to stepdad FAILED. Errors: {wa_errors}")
+                logger.error(f"❌ Telegram to stepdad FAILED. Errors: {tg_errors}")
 
             self._respond(200, {
                 "success": True,
                 "forecast_date": tomorrow,
-                "whatsapp": {
+                "telegram": {
                     "stepdad": stepdad_ok,
                     "monitor": you_ok,
-                    "errors": wa_errors,
+                    "errors": tg_errors,
                 },
                 "forecast": {
                     "hours": final_prices,

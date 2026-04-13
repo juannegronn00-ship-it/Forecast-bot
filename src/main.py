@@ -16,7 +16,7 @@ from src.data.calendar_data import (
 )
 from src.utils.matcher import HourMatcher
 from src.ai.refinement import AIRefiner
-from src.utils.whatsapp_sender import WhatsAppSender
+from src.messengers.telegram_sender import TelegramSender
 
 load_dotenv()
 
@@ -76,7 +76,7 @@ class ForecastBot:
         self.history = HistoricalPatterns()
         self.matcher = HourMatcher()
         self.refiner = AIRefiner()
-        self.sender = WhatsAppSender()
+        self.sender = TelegramSender()
 
     # ────────────────────────────────────────────────────────────────────
     # Core pipeline  (returns prices, does NOT send WhatsApp)
@@ -232,39 +232,16 @@ class ForecastBot:
         return final_prices
 
     # ────────────────────────────────────────────────────────────────────
-    # WhatsApp delivery
+    # Telegram delivery
     # ────────────────────────────────────────────────────────────────────
-    def send_whatsapp(self, final_prices: list) -> dict:
-        """Send forecast via WhatsApp. Returns {stepdad_ok, you_ok, errors}."""
+    def send_telegram(self, final_prices: list) -> dict:
+        """Send forecast via Telegram. Returns {stepdad_ok, you_ok, errors}."""
         if not self.sender.available:
-            logger.warning("⚠️  Twilio credentials not configured — skipping WhatsApp send")
-            return {"stepdad_ok": False, "you_ok": False, "errors": ["Twilio not configured"]}
+            logger.warning("⚠️  TELEGRAM_BOT_TOKEN not configured — skipping send")
+            return {"stepdad_ok": False, "you_ok": False, "errors": ["TELEGRAM_BOT_TOKEN not set"]}
 
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%B %d, %Y")
-        meta = self.sender.calculate_metadata(final_prices)
-
-        stepdad_ok, stepdad_err = self.sender.send_to_stepdad(
-            tomorrow, final_prices, meta["avg"], meta["min_price"], meta["max_price"]
-        )
-        if stepdad_ok:
-            logger.info("✅ WhatsApp sent to stepdad")
-        else:
-            logger.error(f"❌ WhatsApp to stepdad FAILED: {stepdad_err}")
-
-        you_ok, you_err = self.sender.send_to_you(
-            tomorrow, final_prices, meta["avg"], meta["min_price"], meta["max_price"], meta
-        )
-        if you_ok:
-            logger.info("✅ WhatsApp sent to monitoring number")
-        else:
-            logger.warning(f"⚠️  WhatsApp to monitoring failed: {you_err}")
-
-        errors = [e for e in [
-            f"stepdad: {stepdad_err}" if stepdad_err else None,
-            f"monitor: {you_err}" if you_err else None,
-        ] if e]
-
-        return {"stepdad_ok": stepdad_ok, "you_ok": you_ok, "errors": errors}
+        return self.sender.send_forecast(tomorrow, final_prices)
 
     # ────────────────────────────────────────────────────────────────────
     # Local testing entry point
@@ -273,7 +250,7 @@ class ForecastBot:
         """Run pipeline + send (used for local testing only)."""
         prices = self.run_forecast()
         if prices:
-            self.send_whatsapp(prices)
+            self.send_telegram(prices)
         return prices
 
 
