@@ -32,7 +32,7 @@ class handler(BaseHTTPRequestHandler):
             return
 
         logger.info("=" * 60)
-        logger.info(f"CRON TRIGGERED at {datetime.utcnow().isoformat()} UTC")
+        logger.info(f"CRON TRIGGERED at {datetime.utcnow().isoformat()} UTC  pid={os.getpid()}")
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%B %d, %Y")
         logger.info(f"Generating forecast for: {tomorrow}")
         logger.info("=" * 60)
@@ -55,7 +55,9 @@ class handler(BaseHTTPRequestHandler):
             logger.info(f"Pipeline complete | avg=${avg:.2f} | range=${min(final_prices):.2f}–${max(final_prices):.2f}")
 
             # Step 2: send via Telegram
+            logger.info(f"📤 SEND START at {datetime.utcnow().isoformat()} UTC")
             tg_result = bot.send_telegram(final_prices)
+            logger.info(f"📤 SEND END   at {datetime.utcnow().isoformat()} UTC")
             stepdad_ok = tg_result.get("stepdad_ok", False)
             you_ok = tg_result.get("you_ok", False)
             tg_errors = tg_result.get("errors", [])

@@ -150,6 +150,7 @@ def _pjm_block(pjm: Dict) -> str:
     miso_est = pjm.get("miso_estimate", 28)
     spread   = pjm.get("spread", 0)
     signal   = pjm.get("trading_signal", "")
+    hourly   = pjm.get("hourly_prices", [])
 
     if spread >= 15:
         impact = "STRONG pull — generators prefer PJM, MISO supply tightens hrs 16-24. Add $4-8 to shoulder/evening vs no-spread scenario."
@@ -160,6 +161,14 @@ def _pjm_block(pjm: Dict) -> str:
     else:
         impact = "No material interface effect on MISO prices."
 
+    hourly_str = ""
+    if hourly and len(hourly) >= 24:
+        rows = [f"hr{h+1:02d}=${hourly[h]:.1f}" for h in range(11, 24)]
+        hourly_str = (
+            f"\n  Per-hour PJM DA prices (hrs 12-24 — use as per-hour MISO pull signal):\n"
+            f"  {' | '.join(rows)}"
+        )
+
     return (
         f"NEIGHBOR MARKET (PJM Western Hub):\n"
         f"  PJM DA price: ${price:.2f}/MWh\n"
@@ -168,6 +177,7 @@ def _pjm_block(pjm: Dict) -> str:
         f"  Interface capacity: ~6-8 GW bidirectional\n"
         f"  Market impact: {impact}\n"
         f"  Signal: {signal}"
+        f"{hourly_str}"
     )
 
 
@@ -285,7 +295,7 @@ Use these calibrated market mechanics when adjusting from historical {{}}-day av
    Low wind (<7 GW): thermal peakers needed → +$3-6/MWh uplift, especially off-peak hours"""
 
 
-def _hour_table(base_prices, hist_profile, load_forecast, wind_forecast, hourly_w, weekday_stats=None) -> str:
+def _hour_table(base_prices, hist_profile, load_forecast, wind_forecast, hourly_w, weekday_stats=None, pjm_hourly=None) -> str:
     rows = []
     avg_load = sum(load_forecast) / 24 if load_forecast else 100.0
     for h in range(24):
@@ -307,10 +317,13 @@ def _hour_table(base_prices, hist_profile, load_forecast, wind_forecast, hourly_
         else:
             hist_str = "hist=n/a         "
 
+        pjm_str = f"  pjm=${pjm_hourly[h]:.1f}" if (pjm_hourly and h < len(pjm_hourly)) else ""
+
         rows.append(
             f"  hr{hr:02d}[{_period(hr):>13s}]  "
             f"base=${base:5.1f}  {hist_str}  "
             f"load={load:5.0f}GW({pct:3.0f}%)  wind={wind:4.1f}GW  temp={temp}"
+            f"{pjm_str}"
         )
     return "\n".join(rows)
 
@@ -369,6 +382,7 @@ class AIRefiner:
             hourly_w      = weather.get("hourly", []) if weather.get("success") else []
             gas           = ctx.get("gas", {})
             pjm           = ctx.get("pjm", {})
+            pjm_hourly    = pjm.get("hourly_prices", []) if pjm.get("success") else []
             hist_profile  = ctx.get("history_profile", [])
             hist_summary  = ctx.get("history_summary", "")
             weekday_stats = ctx.get("weekday_stats", {})

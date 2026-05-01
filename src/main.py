@@ -7,6 +7,7 @@ from src.scrapers.fantods_scraper import FantodsScraperr
 from src.scrapers.miso_scraper import MISOScraper
 from src.scrapers.weather_scraper import WeatherScraper
 from src.scrapers.gas_prices_scraper import GasPricesScraper
+from src.scrapers.pjm_scraper import PJMScraper
 from src.data.historical_patterns import HistoricalPatterns
 from src.data.calendar_data import (
     demand_profile_label,
@@ -16,6 +17,7 @@ from src.data.calendar_data import (
 )
 from src.utils.matcher import HourMatcher
 from src.ai.refinement import AIRefiner
+from src.data.fantods_optimizer import FantodsOptimizer
 from src.messengers.telegram_sender import TelegramSender
 
 load_dotenv()
@@ -73,8 +75,10 @@ class ForecastBot:
         self.miso = MISOScraper()
         self.weather = WeatherScraper()
         self.gas = GasPricesScraper()
+        self.pjm = PJMScraper()
         self.history = HistoricalPatterns()
         self.matcher = HourMatcher()
+        self.optimizer = FantodsOptimizer()
         self.refiner = AIRefiner()
         self.sender = TelegramSender()
 
@@ -91,7 +95,7 @@ class ForecastBot:
         logger.info("=" * 65)
 
         # ── STEP 1: Fantods base prices ──────────────────────────────────
-        logger.info("\n[1/8] Fantods — base DA-LMP prices...")
+        logger.info("\n[1/10] Fantods — base DA-LMP prices...")
         fantods_result = self.fantods.scrape_data()
 
         if fantods_result["success"]:
@@ -106,7 +110,7 @@ class ForecastBot:
         base_prices = base_prices[:24]
 
         # ── STEP 2: MISO load/wind forecasts ────────────────────────────
-        logger.info("\n[2/8] MISO — system load/wind forecasts...")
+        logger.info("\n[2/10] MISO — system load/wind forecasts...")
         miso_result = self.miso.fetch_data()
 
         if miso_result["success"]:
@@ -134,7 +138,7 @@ class ForecastBot:
         )
 
         # ── STEP 3: Weather ──────────────────────────────────────────────
-        logger.info("\n[3/8] Weather — Chicago MISO load center...")
+        logger.info("\n[3/10] Weather — Chicago MISO load center...")
         weather_result = self.weather.fetch_data()
         if weather_result.get("success"):
             logger.info(f"✅ Weather ({weather_result['source']}): {weather_result['summary']}")
@@ -143,27 +147,39 @@ class ForecastBot:
             logger.warning("⚠️  Weather fetch failed — no weather context for Claude")
 
         # ── STEP 4: Gas prices ───────────────────────────────────────────
-        logger.info("\n[4/8] Gas prices — Henry Hub...")
+        logger.info("\n[4/10] Gas prices — Henry Hub...")
         gas_result = self.gas.fetch_data()
         if gas_result.get("success"):
             logger.info(f"✅ Gas ({gas_result['source']}): {gas_result['trading_signal']}")
         else:
             logger.warning("⚠️  Gas price fetch failed")
 
-        # ── STEP 5: Historical same-weekday patterns ─────────────────────
-        logger.info("\n[5/8] Historical patterns — same weekday analysis...")
+        # ── STEP 5: PJM market correlation ──────────────────────────────
+        logger.info("\n[5/10] PJM market — interface correlation signal...")
+        pjm_result = self.pjm.fetch_data()
+        if pjm_result.get("success"):
+            logger.info(f"✅ PJM ({pjm_result['source']}): {pjm_result['trading_signal']}")
+        else:
+            logger.warning("⚠️  PJM fetch failed — no interface signal")
+
+        # ── STEP 6: Historical same-weekday patterns ─────────────────────
+        logger.info("\n[6/10] Historical patterns — same weekday analysis...")
         self.history.load()
-        hist_summary = ""
-        hist_profile = []
+        hist_summary  = ""
+        hist_profile  = []
+        weekday_stats = {}
         if self.history.loaded:
-            hist_summary = self.history.summary_for_date(tomorrow_date)
-            hist_profile = self.history.get_weekday_profile(tomorrow_date.weekday())
+            hist_summary  = self.history.summary_for_date(tomorrow_date)
+            hist_profile  = self.history.get_weekday_profile(tomorrow_date.weekday())
+            weekday_stats = self.history.get_weekday_stats(tomorrow_date.weekday())
+            n_hrs = sum(1 for s in weekday_stats.values() if s)
             logger.info(f"✅ History: {hist_summary}")
+            logger.info(f"   Per-hour stats available: {n_hrs}/24 hours")
         else:
             logger.warning("⚠️  Historical patterns unavailable")
 
         # ── STEP 6: Calendar context ─────────────────────────────────────
-        logger.info("\n[6/8] Calendar context...")
+        logger.info("\n[7/10] Calendar context...")
         cal_label = demand_profile_label(tomorrow_date)
         dl_hours = daylight_hours(tomorrow_date)
         lf = load_adjustment_factor(tomorrow_date)
@@ -171,21 +187,53 @@ class ForecastBot:
         logger.info(f"   {cal_label}")
         logger.info(f"   {solar_signal}  |  load_factor={lf:.3f}")
 
-        # ── STEP 7: Claude expert refinement ────────────────────────────
-        logger.info("\n[7/8] Claude expert refinement (full trader context)...")
+        # Check holiday flag for optimizer
+        try:
+            from src.data.calendar_data import is_holiday
+            holiday_flag = is_holiday(tomorrow_date)
+        except Exception:
+            holiday_flag = False
+
+        # ── STEP 7: Fantods data-driven optimization (zero API cost) ────
+        logger.info("\n[8/10] Fantods optimizer — data-driven shape correction...")
 
         trader_context = {
             "weather": weather_result,
             "gas": gas_result,
+            "pjm": pjm_result,
             "history_summary": hist_summary,
             "history_profile": hist_profile,
+            "weekday_stats": weekday_stats,
             "calendar": cal_label,
             "daylight_hrs": dl_hours,
             "load_factor": lf,
+            "weekday_int": tomorrow_date.weekday(),
+            "is_holiday": holiday_flag,
         }
 
-        claude_result = self.refiner.claude_refine(
+        opt_result = self.optimizer.optimize(
             base_prices,
+            load_forecast,
+            wind_forecast,
+            trader_context=trader_context,
+        )
+
+        if opt_result["success"]:
+            optimized_prices = opt_result["optimized_prices"]
+            opt_diffs = [round(optimized_prices[i] - base_prices[i], 2) for i in range(24)]
+            logger.info(f"✅ Optimizer complete | deltas vs base: {opt_diffs}")
+        else:
+            logger.warning("⚠️  Optimizer failed — using raw base prices")
+            optimized_prices = list(base_prices)
+
+        # ── STEP 9: Claude pure-reasoning forecast ──────────────────────
+        # Claude sees raw base prices as REFERENCE only, plus all market signals.
+        # It reasons from first principles to absolute prices — no % adjustments.
+        # If Claude fails (no credits / error), optimizer output is the fallback.
+        logger.info("\n[9/10] Claude pure-reasoning forecast...")
+
+        claude_result = self.refiner.claude_refine(
+            base_prices,            # raw 40-day mean as reference baseline
             load_forecast,
             wind_forecast,
             target_date=tomorrow_str,
@@ -195,16 +243,18 @@ class ForecastBot:
         if claude_result["success"]:
             refined_prices = claude_result["refined_prices"]
             clamped = claude_result.get("clamped_hours", 0)
-            logger.info(f"✅ Claude: clamped_hours={clamped}")
-            logger.info(f"   Reasoning: {claude_result.get('reasoning', '')}")
+            logger.info(f"✅ Claude reasoning complete | sanity_clamped={clamped} hours")
             diffs = [round(refined_prices[i] - base_prices[i], 2) for i in range(24)]
-            logger.info(f"   Deltas: {diffs}")
+            logger.info(f"   Claude deltas vs base: {diffs}")
         else:
-            logger.warning(f"⚠️  Claude failed: {claude_result.get('error')} — using base prices")
-            refined_prices = list(base_prices)
+            logger.warning(
+                f"⚠️  Claude failed: {claude_result.get('error')} "
+                f"— falling back to data-driven optimizer output"
+            )
+            refined_prices = list(optimized_prices)   # optimizer, not raw base
 
-        # ── STEP 8: Gemini validation ────────────────────────────────────
-        logger.info("\n[8/8] Gemini validation...")
+        # ── STEP 9: Gemini validation ────────────────────────────────────
+        logger.info("\n[10/10] Gemini validation...")
         gemini_result = self.refiner.gemini_validate(
             refined_prices,
             base_prices,

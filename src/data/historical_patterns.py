@@ -168,6 +168,42 @@ class HistoricalPatterns:
             return None
         return self.by_date[candidates[0]]
 
+    def get_weekday_stats(self, weekday: int) -> dict:
+        """
+        Return per-hour statistics for a given weekday (last 5 occurrences).
+        Returns {1: {avg, min, max, std, n, recent}, ...} for hours 1-24.
+        Used to give Claude historical range/variance, not just averages.
+        """
+        stats = {}
+        for hr in range(1, 25):
+            prices = self.by_weekday.get(weekday, {}).get(hr, [])
+            if not prices:
+                stats[hr] = None
+                continue
+            recent = prices[-5:]
+            avg = sum(recent) / len(recent)
+            mn = min(recent)
+            mx = max(recent)
+            var = sum((p - avg) ** 2 for p in recent) / len(recent)
+            std = var ** 0.5
+            stats[hr] = {
+                "avg": round(avg, 2),
+                "min": round(mn, 2),
+                "max": round(mx, 2),
+                "std": round(std, 2),
+                "n": len(recent),
+                "recent": [round(p, 2) for p in recent],
+            }
+        return stats
+
+    def get_last_n_same_weekday(self, weekday: int, n: int = 3) -> list:
+        """Return the last N date profiles for a given weekday, newest first."""
+        candidates = sorted(
+            [dt for dt in self.by_date if dt.weekday() == weekday],
+            reverse=True,
+        )
+        return [(dt, self.by_date[dt]) for dt in candidates[:n]]
+
     def summary_for_date(self, target_date: date) -> str:
         """Human-readable summary of historical same-weekday data."""
         wd = target_date.weekday()
