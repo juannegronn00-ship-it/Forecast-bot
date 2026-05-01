@@ -10,6 +10,8 @@ from typing import List, Dict, Optional
 logger = logging.getLogger(__name__)
 
 _API_BASE = "https://api.telegram.org/bot{token}/{method}"
+_SENT_FLAG_DIR = "/tmp"   # Vercel /tmp persists within a warm instance
+_REDIS_TTL_SECONDS = 93600  # 26 hours — covers any same-day cold-start retry
 
 # TOU labels for the message — makes it readable at a glance
 _PERIOD = {
@@ -52,6 +54,19 @@ class TelegramSender:
         self.stepdad_chat_id = os.getenv("TELEGRAM_STEPDAD_CHAT_ID", "")
         self.your_chat_id = os.getenv("TELEGRAM_YOUR_CHAT_ID", "")
         self._sent_this_run: set = set()  # dedup guard: track chat_ids sent in this process
+
+        # Log the routing configuration on every init so Vercel logs show exactly
+        # which chat IDs are wired up (helps diagnose routing bugs).
+        logger.info(
+            f"TelegramSender init: stepdad_chat_id={self.stepdad_chat_id!r} "
+            f"your_chat_id={self.your_chat_id!r} "
+            f"token_set={bool(self.token)}"
+        )
+        if self.stepdad_chat_id == self.your_chat_id and self.stepdad_chat_id:
+            logger.warning(
+                "⚠️  ROUTING MISMATCH: TELEGRAM_STEPDAD_CHAT_ID == TELEGRAM_YOUR_CHAT_ID "
+                f"({self.stepdad_chat_id}) — stepdad and monitor point to the same chat!"
+            )
 
     @property
     def available(self) -> bool:
@@ -146,13 +161,106 @@ class TelegramSender:
         """Send to TELEGRAM_YOUR_CHAT_ID. Returns (success, error_or_None)."""
         return self._send_once(self.your_chat_id, message, "monitor")
 
+    # ------------------------------------------------------------------ #
+    # Persistent idempotency (Upstash Redis — survives cold starts)
+    # ------------------------------------------------------------------ #
+    # Set UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN in Vercel env
+    # to enable cross-invocation duplicate protection.  When not set, the
+    # bot falls back to the /tmp flag (works within a single warm instance).
+    # Get a free Upstash Redis at https://upstash.com — takes ~2 minutes.
+
+    @staticmethod
+    def _redis_key(date_str: str) -> str:
+        safe = date_str.replace(" ", "_").replace(",", "")
+        return f"dalmp_sent:{safe}"
+
+    def _redis_check(self, date_str: str) -> bool:
+        """Return True if Upstash Redis shows this date was already sent."""
+        url   = os.getenv("UPSTASH_REDIS_REST_URL", "")
+        token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+        if not (url and token):
+            return False
+        try:
+            resp = requests.get(
+                f"{url.rstrip('/')}/get/{self._redis_key(date_str)}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=5,
+            )
+            return resp.json().get("result") is not None
+        except Exception as e:
+            logger.warning(f"Redis idempotency check failed (non-critical): {e}")
+            return False
+
+    def _redis_mark(self, date_str: str) -> None:
+        """Write sent flag to Upstash Redis with a 26-hour TTL."""
+        url   = os.getenv("UPSTASH_REDIS_REST_URL", "")
+        token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+        if not (url and token):
+            return
+        try:
+            requests.get(
+                f"{url.rstrip('/')}/set/{self._redis_key(date_str)}/1/ex/{_REDIS_TTL_SECONDS}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=5,
+            )
+            logger.info(f"Redis idempotency flag set for '{date_str}' (TTL {_REDIS_TTL_SECONDS}s)")
+        except Exception as e:
+            logger.warning(f"Redis idempotency mark failed (non-critical): {e}")
+
+    # ------------------------------------------------------------------ #
+    # /tmp flag (fast secondary guard within a warm instance)
+    # ------------------------------------------------------------------ #
+
+    def _daily_flag_path(self, date_str: str) -> str:
+        """Path of the daily idempotency flag file."""
+        safe = date_str.replace(" ", "_").replace(",", "")
+        return os.path.join(_SENT_FLAG_DIR, f"telegram_sent_{safe}.flag")
+
+    def _already_sent_today(self, date_str: str) -> bool:
+        """
+        Return True if forecast for this date was already sent.
+        Checks two layers in order:
+          1. Upstash Redis  — persistent across cold starts (requires env vars)
+          2. /tmp flag file — fast guard within a single warm Lambda instance
+        """
+        # Layer 1: Redis (survives cold starts — the real fix for Vercel duplicates)
+        if self._redis_check(date_str):
+            logger.warning(
+                f"⚠️  Redis send-guard: forecast for '{date_str}' already sent this day. "
+                "Skipping duplicate (cold-start protected)."
+            )
+            return True
+        # Layer 2: /tmp flag (fast path within same warm instance)
+        flag = self._daily_flag_path(date_str)
+        if os.path.exists(flag):
+            logger.warning(
+                f"⚠️  /tmp send-guard: forecast for '{date_str}' already sent "
+                f"this instance (flag={flag}). Skipping duplicate send."
+            )
+            return True
+        return False
+
+    def _mark_sent_today(self, date_str: str) -> None:
+        """Write idempotency flags to both Redis and /tmp."""
+        self._redis_mark(date_str)  # persistent — survives cold starts
+        try:
+            with open(self._daily_flag_path(date_str), "w") as f:
+                import datetime as _dt
+                f.write(_dt.datetime.utcnow().isoformat())
+        except Exception:
+            pass  # /tmp write failure is non-fatal
+
     def send_forecast(self, date_str: str, prices: List[float]) -> Dict:
         """
         Send forecast to stepdad then to monitoring.
-        Each recipient receives exactly one message per run — duplicate
-        chat IDs or retry calls are silently skipped by _send_once().
+        Guards:
+          1. daily flag file — blocks re-sends within the same Vercel instance
+          2. _sent_this_run set — blocks duplicate chat_ids within one call
         Returns {stepdad_ok, you_ok, errors}.
         """
+        if self._already_sent_today(date_str):
+            return {"stepdad_ok": True, "you_ok": True, "errors": ["already_sent_today"]}
+
         message = self.format_message(date_str, prices)
 
         stepdad_ok, stepdad_err = self.send_to_stepdad(message)
@@ -171,6 +279,9 @@ class TelegramSender:
             f"stepdad: {stepdad_err}" if stepdad_err else None,
             f"monitor: {you_err}" if you_err else None,
         ] if e]
+
+        if stepdad_ok:
+            self._mark_sent_today(date_str)
 
         return {"stepdad_ok": stepdad_ok, "you_ok": you_ok, "errors": errors}
 
