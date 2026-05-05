@@ -24,6 +24,9 @@ import requests
 from datetime import date, timedelta
 from typing import Dict, List, Optional
 
+_MISO_CSV_BASE = "https://docs.misoenergy.org/marketreports"
+_MISO_HEADERS  = {"User-Agent": "forecast-bot/2.0 (contact@example.com)"}
+
 logger = logging.getLogger(__name__)
 
 # EIA series ID for PJM day-ahead price (Western Hub)
@@ -96,11 +99,17 @@ class PJMScraper:
           'trading_signal': str,
         }
         """
-        # Try EIA first
+        # Try EIA first (most reliable when key is set)
         if self._eia_key:
             result = self._fetch_eia()
             if result["success"]:
                 return result
+
+        # Try MISO Indiana Hub from the DA LMP CSV as a PJM proxy
+        # Indiana Hub sits on the MISO-PJM border and trades $4-8 below PJM Western Hub
+        result = self._fetch_indiana_hub_proxy()
+        if result["success"]:
+            return result
 
         # Try PJM public data
         result = self._fetch_pjm_public()
@@ -248,6 +257,43 @@ class PJMScraper:
             return {"success": False, "error": str(e)}
 
     # ------------------------------------------------------------------ #
+    # MISO Indiana Hub proxy for PJM Western Hub (no auth needed)
+    # ------------------------------------------------------------------ #
+    def _fetch_indiana_hub_proxy(self) -> Dict:
+        """
+        INDIANA.HUB sits directly on the MISO-PJM interface and cleared DA prices
+        track PJM Western Hub closely.  The typical Indiana Hub → PJM Western Hub
+        spread is +$4 to +$8/MWh due to PJM internal transmission constraints.
+
+        Source: MISO DA ExAnte LMP CSV (publicly available, no key required).
+        """
+        try:
+            today_str = date.today().strftime("%Y%m%d")
+            url = f"{_MISO_CSV_BASE}/{today_str}_da_exante_lmp.csv"
+            resp = requests.get(url, headers=_MISO_HEADERS, timeout=15)
+            resp.raise_for_status()
+
+            indiana_prices = _parse_node_lmp(resp.text, "INDIANA.HUB")
+            if len(indiana_prices) != 24:
+                logger.warning(f"Indiana Hub parse returned {len(indiana_prices)} prices")
+                return {"success": False, "error": "Indiana Hub not found"}
+
+            # PJM Western Hub ≈ Indiana Hub + $6/MWh interface spread (typical)
+            _INDIANA_PJM_SPREAD = 6.0
+            pjm_hourly = [round(p + _INDIANA_PJM_SPREAD, 2) for p in indiana_prices]
+            pjm_avg    = sum(pjm_hourly) / 24
+
+            logger.info(
+                f"PJM proxy (Indiana Hub + ${_INDIANA_PJM_SPREAD:.0f} spread): "
+                f"avg=${pjm_avg:.2f}  max=${max(pjm_hourly):.2f}"
+            )
+            return self._build_result("MISO Indiana Hub proxy", pjm_avg, hourly_prices=pjm_hourly)
+
+        except Exception as e:
+            logger.warning(f"Indiana Hub PJM proxy failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    # ------------------------------------------------------------------ #
     # Seasonal fallback
     # ------------------------------------------------------------------ #
     def _seasonal_estimate(self) -> Dict:
@@ -299,3 +345,22 @@ class PJMScraper:
             # 24-hour shaped array — used by Claude prompt for per-hour PJM context
             "hourly_prices":   [round(p, 2) for p in (hourly_prices or _shape_from_daily(pjm_price))],
         }
+
+
+def _parse_node_lmp(csv_text: str, node_name: str) -> List[float]:
+    """Parse 24-hour LMP prices for a specific node from MISO DA ExAnte LMP CSV."""
+    prefix = f"{node_name},Hub,LMP"
+    for line in csv_text.split("\n"):
+        if line.startswith(prefix):
+            parts = line.split(",")
+            prices = []
+            for v in parts[3:27]:
+                v = v.strip()
+                if v:
+                    try:
+                        prices.append(float(v))
+                    except ValueError:
+                        pass
+            if len(prices) == 24:
+                return prices
+    return []

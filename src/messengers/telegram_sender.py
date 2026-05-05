@@ -76,7 +76,13 @@ class TelegramSender:
     # Message formatting
     # ------------------------------------------------------------------ #
     @staticmethod
-    def format_message(date_str: str, prices: List[float]) -> str:
+    def format_message(
+        date_str: str,
+        prices: List[float],
+        signal_summary: str = "",
+        peak_driver: str = "",
+        risk_flags: str = "",
+    ) -> str:
         """
         Build a clean, readable forecast message.
 
@@ -91,6 +97,9 @@ class TelegramSender:
 
           📊 Avg $32.58 · Min $19.00 · Max $71.00
           📈 Peak: Hour 20 ($71.00)  📉 Low: Hour 2 ($19.00)
+
+          📡 Signal Summary: ...
+          ⚠️ Risk: ...
         """
         avg = sum(prices) / len(prices)
         mn = min(prices)
@@ -121,6 +130,13 @@ class TelegramSender:
             f"📊 <b>Avg</b> ${avg:.2f} · <b>Min</b> ${mn:.2f} · <b>Max</b> ${mx:.2f}",
             f"📈 Peak: Hour {peak_h:02d} (${mx:.2f})  📉 Low: Hour {low_h:02d} (${mn:.2f})",
         ]
+
+        if signal_summary:
+            lines += ["", f"📡 <b>Signal Summary:</b> {signal_summary}"]
+        if peak_driver:
+            lines += [f"📌 <b>Peak Driver:</b> {peak_driver}"]
+        if risk_flags:
+            lines += [f"⚠️ <b>Risk:</b> {risk_flags}"]
 
         return "\n".join(lines)
 
@@ -250,7 +266,14 @@ class TelegramSender:
         except Exception:
             pass  # /tmp write failure is non-fatal
 
-    def send_forecast(self, date_str: str, prices: List[float]) -> Dict:
+    def send_forecast(
+        self,
+        date_str: str,
+        prices: List[float],
+        signal_summary: str = "",
+        peak_driver: str = "",
+        risk_flags: str = "",
+    ) -> Dict:
         """
         Send forecast to stepdad then to monitoring.
         Guards:
@@ -261,7 +284,12 @@ class TelegramSender:
         if self._already_sent_today(date_str):
             return {"stepdad_ok": True, "you_ok": True, "errors": ["already_sent_today"]}
 
-        message = self.format_message(date_str, prices)
+        message = self.format_message(
+            date_str, prices,
+            signal_summary=signal_summary,
+            peak_driver=peak_driver,
+            risk_flags=risk_flags,
+        )
 
         stepdad_ok, stepdad_err = self.send_to_stepdad(message)
         if stepdad_ok:

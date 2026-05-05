@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 
 from src.scrapers.fantods_scraper import FantodsScraperr
 from src.scrapers.miso_scraper import MISOScraper
+from src.scrapers.miso_realtime_scraper import MISORealtimeScraper
+from src.scrapers.miso_outages_scraper import MISOOutagesScraper
 from src.scrapers.weather_scraper import WeatherScraper
 from src.scrapers.gas_prices_scraper import GasPricesScraper
 from src.scrapers.pjm_scraper import PJMScraper
@@ -73,6 +75,8 @@ class ForecastBot:
 
         self.fantods = FantodsScraperr()
         self.miso = MISOScraper()
+        self.miso_rt = MISORealtimeScraper()
+        self.miso_outages = MISOOutagesScraper()
         self.weather = WeatherScraper()
         self.gas = GasPricesScraper()
         self.pjm = PJMScraper()
@@ -81,6 +85,7 @@ class ForecastBot:
         self.optimizer = FantodsOptimizer()
         self.refiner = AIRefiner()
         self.sender = TelegramSender()
+        self._ai_signals: dict = {}   # populated by run_forecast, consumed by send_telegram
 
     # ────────────────────────────────────────────────────────────────────
     # Core pipeline  (returns prices, does NOT send WhatsApp)
@@ -162,6 +167,28 @@ class ForecastBot:
         else:
             logger.warning("⚠️  PJM fetch failed — no interface signal")
 
+        # ── STEP 5a: MISO real-time LMP ─────────────────────────────────
+        logger.info("\n[5a] MISO RT LMP — current price snapshot...")
+        rt_lmp_result = self.miso_rt.fetch_data()
+        if rt_lmp_result.get("success"):
+            logger.info(
+                f"✅ MISO RT LMP: ${rt_lmp_result['rt_lmp_current']:.2f}/MWh "
+                f"(trend={rt_lmp_result['rt_lmp_trend']})"
+            )
+        else:
+            logger.warning("⚠️  MISO RT LMP unavailable — signal omitted")
+
+        # ── STEP 5b: MISO outages ────────────────────────────────────────
+        logger.info("\n[5b] MISO outages — unplanned MW offline...")
+        outages_result = self.miso_outages.fetch_data()
+        if outages_result.get("success"):
+            logger.info(
+                f"✅ MISO outages: {outages_result['outage_mw']:,} MW | "
+                f"alert={outages_result['alert_level']}"
+            )
+        else:
+            logger.warning("⚠️  MISO outages unavailable — assuming normal")
+
         # ── STEP 6: Historical same-weekday patterns ─────────────────────
         logger.info("\n[6/10] Historical patterns — same weekday analysis...")
         self.history.load()
@@ -201,6 +228,8 @@ class ForecastBot:
             "weather": weather_result,
             "gas": gas_result,
             "pjm": pjm_result,
+            "rt_lmp": rt_lmp_result,
+            "outages": outages_result,
             "history_summary": hist_summary,
             "history_profile": hist_profile,
             "weekday_stats": weekday_stats,
@@ -226,14 +255,14 @@ class ForecastBot:
             logger.warning("⚠️  Optimizer failed — using raw base prices")
             optimized_prices = list(base_prices)
 
-        # ── STEP 9: Claude pure-reasoning forecast ──────────────────────
-        # Claude sees raw base prices as REFERENCE only, plus all market signals.
-        # It reasons from first principles to absolute prices — no % adjustments.
-        # If Claude fails (no credits / error), optimizer output is the fallback.
-        logger.info("\n[9/10] Claude pure-reasoning forecast...")
+        # ── STEP 9: Claude signal-driven forecast ───────────────────────
+        # Uses trader's framework: Price ≈ Demand − Renewables + Outages + Congestion.
+        # Reasons from fundamentals — does NOT adjust from a historical base.
+        # Falls back to optimizer output if Claude call fails.
+        logger.info("\n[9/10] Claude signal-driven forecast (trader's framework)...")
 
-        claude_result = self.refiner.claude_refine(
-            base_prices,            # raw 40-day mean as reference baseline
+        claude_result = self.refiner.claude_refine_with_signals(
+            base_prices,
             load_forecast,
             wind_forecast,
             target_date=tomorrow_str,
@@ -243,15 +272,22 @@ class ForecastBot:
         if claude_result["success"]:
             refined_prices = claude_result["refined_prices"]
             clamped = claude_result.get("clamped_hours", 0)
-            logger.info(f"✅ Claude reasoning complete | sanity_clamped={clamped} hours")
+            logger.info(f"✅ Claude signal-driven forecast complete | clamped={clamped} hours")
             diffs = [round(refined_prices[i] - base_prices[i], 2) for i in range(24)]
             logger.info(f"   Claude deltas vs base: {diffs}")
+            # Store signal metadata for Telegram
+            self._ai_signals = {
+                "signal_summary": claude_result.get("signal_summary", ""),
+                "peak_driver":    claude_result.get("peak_driver", ""),
+                "risk_flags":     claude_result.get("risk_flags", ""),
+            }
         else:
             logger.warning(
                 f"⚠️  Claude failed: {claude_result.get('error')} "
                 f"— falling back to data-driven optimizer output"
             )
-            refined_prices = list(optimized_prices)   # optimizer, not raw base
+            refined_prices = list(optimized_prices)
+            self._ai_signals = {}
 
         # ── STEP 9: Gemini validation ────────────────────────────────────
         logger.info("\n[10/10] Gemini validation...")
@@ -291,7 +327,14 @@ class ForecastBot:
             return {"stepdad_ok": False, "you_ok": False, "errors": ["TELEGRAM_BOT_TOKEN not set"]}
 
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%B %d, %Y")
-        return self.sender.send_forecast(tomorrow, final_prices)
+        signals = self._ai_signals  # populated by run_forecast()
+        return self.sender.send_forecast(
+            tomorrow,
+            final_prices,
+            signal_summary=signals.get("signal_summary", ""),
+            peak_driver=signals.get("peak_driver", ""),
+            risk_flags=signals.get("risk_flags", ""),
+        )
 
     # ────────────────────────────────────────────────────────────────────
     # Local testing entry point

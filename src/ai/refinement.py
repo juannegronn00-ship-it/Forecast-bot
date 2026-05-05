@@ -15,9 +15,10 @@ Gemini approach:
 """
 import logging
 import json
+import math
 import re
 from typing import List, Dict, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, date
 from anthropic import Anthropic
 import google.generativeai as genai
 import os
@@ -60,6 +61,38 @@ _ABS_BOUNDS = {
 }
 _PRICE_FLOOR   = 4.0
 _PRICE_CEILING = 300.0
+
+
+def _estimate_solar_24h(month: int, cloud_pct_24h: List[float]) -> List[int]:
+    """
+    Estimate MISO solar generation (MW) for each of 24 hours.
+
+    Peak installed capacity by month reflects seasonal installed base + daylight.
+    Intraday factor is a bell curve centred at solar noon (hour 13).
+    Cloud cover linearly reduces output (100% cloud → ~15% of clear-sky).
+    """
+    peak_mw = {
+        1: 8000, 2: 9000,  3: 12000, 4: 14000,
+        5: 15000, 6: 16000, 7: 16000, 8: 15000,
+        9: 13000, 10: 11000, 11: 8000, 12: 7000,
+    }.get(month, 12000)
+
+    # Intraday factors: index 0 = hour 1 (midnight-1am)
+    day_factors = [
+        0,    0,    0,    0,    0,    0,        # hrs 1-6  night
+        0.05, 0.22, 0.45, 0.67,                 # hrs 7-10 morning ramp
+        0.84, 0.94, 1.00, 0.96,                 # hrs 11-14 peak
+        0.84, 0.62, 0.38, 0.18,                 # hrs 15-18 afternoon decline
+        0.04, 0,    0,    0,    0,    0,         # hrs 19-24 dusk/night
+    ]
+
+    result = []
+    for h in range(24):
+        cloud = cloud_pct_24h[h] if h < len(cloud_pct_24h) else 50
+        cloud_factor = 1.0 - (cloud / 100.0) * 0.85
+        mw = peak_mw * day_factors[h] * cloud_factor
+        result.append(round(mw))
+    return result
 
 
 def _sanity_clamp(hour: int, proposed: float, base: float, hist: float = 0.0) -> Tuple[float, bool]:
@@ -506,14 +539,20 @@ Respond ONLY with valid JSON (no markdown fences, no extra text outside JSON):
                 logger.warning(f"Extended thinking failed ({thinking_err}), falling back to standard Opus call")
                 response = self.claude_client.messages.create(
                     model="claude-opus-4-6",
-                    max_tokens=4000,
+                    max_tokens=6000,
                     messages=[{"role": "user", "content": prompt}],
                 )
-                raw = response.content[0].text
+                raw = response.content[0].text if response.content else ""
+
+            if not raw or not raw.strip():
+                raise ValueError("Claude returned empty response")
 
             # ── Parse response ────────────────────────────────────────
             clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
-            data  = json.loads(clean)
+            json_match = re.search(r'\{[\s\S]*\}', clean)
+            if not json_match:
+                raise ValueError(f"No JSON in response (first 200: {clean[:200]!r})")
+            data  = json.loads(json_match.group(0))
 
             prices_raw    = data.get("prices", {})
             reasoning_map = data.get("reasoning", {})
@@ -562,6 +601,302 @@ Respond ONLY with valid JSON (no markdown fences, no extra text outside JSON):
             return {
                 "success":        False,
                 "refined_prices": list(base_prices),
+                "error":          str(e),
+            }
+
+    # ------------------------------------------------------------------ #
+    # Signal-driven forecast (trader's framework — new primary method)
+    # ------------------------------------------------------------------ #
+    def claude_refine_with_signals(
+        self,
+        base_prices: List[float],
+        load_forecast: List[float],
+        wind_forecast: List[float],
+        target_date: Optional[str] = None,
+        trader_context: Optional[Dict] = None,
+    ) -> Dict:
+        """
+        Signal-driven DA-LMP forecast using the professional trader's framework.
+
+        Price ≈ Demand − Renewables + Outages + Congestion + Gas_floor + PJM_pull
+
+        Does NOT start from a historical base and adjust percentages.
+        Instead reasons from fundamentals for each hour.
+
+        Returns same shape as claude_refine() plus:
+          signal_summary, peak_driver, risk_flags
+        """
+        ctx = trader_context or {}
+        try:
+            # ── Date context ─────────────────────────────────────────────
+            dow, is_holiday_str = "Unknown", "No"
+            tomorrow_month = date.today().month
+            if target_date:
+                try:
+                    dt = datetime.strptime(target_date, "%B %d, %Y")
+                    dow = dt.strftime("%A")
+                    tomorrow_month = dt.month
+                except Exception:
+                    pass
+
+            is_holiday = ctx.get("is_holiday", False)
+            is_holiday_str = "Yes" if is_holiday else "No"
+
+            # ── Extract signals ──────────────────────────────────────────
+            weather      = ctx.get("weather", {})
+            gas          = ctx.get("gas", {})
+            pjm          = ctx.get("pjm", {})
+            rt_lmp_data  = ctx.get("rt_lmp", {})
+            outages_data = ctx.get("outages", {})
+
+            # Weather arrays (24h)
+            temps_f    = weather.get("temps_f", []) if weather.get("success") else []
+            wind_mph   = weather.get("wind_mph", []) if weather.get("success") else []
+            cloud_pct  = weather.get("cloud_pct", []) if weather.get("success") else []
+
+            # Pad to 24 values if short
+            def _pad(lst, default):
+                return (lst + [default] * 24)[:24]
+
+            temps_f   = _pad(temps_f, 65)
+            wind_mph  = _pad(wind_mph, 10)
+            cloud_pct = _pad(cloud_pct, 50)
+
+            # Load & wind (MW — MISO reports in GW sometimes, keep as-is)
+            avg_load  = sum(load_forecast) / 24 if load_forecast else 100.0
+            avg_wind  = sum(wind_forecast) / 24 if wind_forecast else 10.0
+            load_vs_avg = (
+                f"ABOVE average by {(max(load_forecast)/avg_load - 1)*100:.0f}% at peak"
+                if max(load_forecast) > avg_load * 1.08 else
+                "Near or below average"
+            )
+
+            # Solar estimate (MW by hour)
+            solar_est = _estimate_solar_24h(tomorrow_month, cloud_pct)
+            total_renewable = [
+                round((wind_forecast[h] if h < len(wind_forecast) else avg_wind) + solar_est[h])
+                for h in range(24)
+            ]
+
+            # Gas
+            gas_price = gas.get("price", 2.20) if gas.get("success") else 2.20
+            gas_implied = round(gas_price * 9, 2)
+
+            # RT LMP
+            rt_lmp_current = rt_lmp_data.get("rt_lmp_current")
+            rt_trend       = rt_lmp_data.get("rt_lmp_trend", "flat")
+            if rt_lmp_current is None:
+                rt_lmp_str = "unavailable"
+            else:
+                rt_lmp_str = f"{rt_lmp_current:.2f}"
+
+            # PJM
+            pjm_hourly = pjm.get("hourly_prices", []) if pjm.get("success") else []
+            if len(pjm_hourly) < 24:
+                from src.scrapers.pjm_scraper import _shape_from_daily, _SEASONAL_PJM
+                pjm_avg = pjm.get("pjm_price", _SEASONAL_PJM.get(tomorrow_month, 40.0))
+                pjm_hourly = _shape_from_daily(pjm_avg)
+
+            # Outages
+            outage_mw   = outages_data.get("outage_mw", 0) if outages_data.get("success") else 0
+            alert_level = outages_data.get("alert_level", "normal") if outages_data.get("success") else "unknown (data unavailable)"
+
+            # Format lists as compact strings for prompt
+            def _fmt_list(lst, fmt=".0f"):
+                return "[" + ", ".join(format(v, fmt) for v in lst) + "]"
+
+            # ── Build prompt ─────────────────────────────────────────────
+            prompt = f"""You are a professional MISO energy market analyst using the same methodology as experienced DA-LMP traders.
+
+YOUR FRAMEWORK (use this exact reasoning order):
+
+STEP 1 - WEATHER CHECK:
+Tomorrow's hourly temperatures (°F): {_fmt_list(temps_f)}
+Tomorrow's wind speed (mph): {_fmt_list(wind_mph, '.1f')}
+Tomorrow's cloud cover (%): {_fmt_list(cloud_pct)}
+→ High temps (>85°F) = AC load spike. Low temps (<30°F) = heating load spike. Either drives prices up.
+→ High wind (>15mph sustained) = strong renewable output = price suppression.
+→ High cloud cover = solar generation impaired = less supply = prices slightly up midday.
+
+STEP 2 - LOAD FORECAST:
+MISO expected load tomorrow (MW by hour): {_fmt_list(load_forecast)}
+Average load: {avg_load:.0f} MW
+Is tomorrow's load above or below average? {load_vs_avg}
+→ Load above average = upward price pressure. Load below = downward pressure.
+
+STEP 3 - WIND + SOLAR GENERATION:
+MISO wind generation forecast (MW by hour): {_fmt_list(wind_forecast)}
+Estimated solar output (MW, based on cloud cover + season): {_fmt_list(solar_est)}
+Total renewable forecast by hour: {_fmt_list(total_renewable)}
+→ High renewable output = more supply = lower prices. Particularly impacts hours 10-16 (solar peak) and whenever wind is strong.
+
+STEP 4 - OUTAGES + GRID STRESS:
+Reported unplanned outages (MW offline): {outage_mw:,}
+Grid alert level: {alert_level}
+→ Every 1,000 MW of outages in a tight market = roughly $3-8/MWh upward pressure during peak hours.
+→ If alert_level is 'elevated' or 'high', add spike risk premium to hours 17-20.
+
+STEP 5 - REAL-TIME PRICE MOMENTUM:
+Current real-time LMP: ${rt_lmp_str}/MWh
+RT price trend (last 3 hours): {rt_trend}
+→ Rising RT prices = market tightening = DA prices likely to follow up.
+→ Falling RT prices = oversupply = DA prices at risk of coming in lower.
+
+STEP 6 - NEIGHBOR MARKET (PJM):
+PJM Western Hub DA-LMP by hour: {_fmt_list(pjm_hourly, '.1f')}
+MISO typically trades at a $2-6/MWh discount to PJM due to interface limits.
+→ If PJM is high (>$60), MISO will be pulled up toward it.
+→ If PJM is low (<$35), there is no upward pull from the neighbor market.
+
+STEP 7 - NATURAL GAS:
+Henry Hub gas price: ${gas_price:.2f}/MMBtu
+MISO gas heat rate: ~9,000 BTU/kWh
+Gas-implied energy cost: ${gas_implied:.2f}/MWh
+→ This is the floor for gas-fired generation marginal cost. Prices rarely stay below this during peak hours for extended periods.
+
+STEP 8 - DAY-OF-WEEK + CALENDAR:
+Tomorrow is: {dow}
+Is tomorrow a holiday? {is_holiday_str}
+→ Monday-Friday: normal commercial + industrial load
+→ Saturday: -10 to -15% load vs weekday
+→ Sunday: -15 to -20% load vs weekday
+→ Holiday: treat like Sunday or lower
+
+NOW APPLY THE TRADER'S FORMULA FOR EACH HOUR:
+Price ≈ Demand_factor − Renewable_factor + Outage_factor + Congestion_factor + Gas_floor_factor + PJM_pull_factor
+
+DO NOT start from a historical base price and adjust it. START FROM THE SIGNALS.
+
+For each of the 24 hours, reason through:
+- What is demand doing this hour? (load forecast, temperature, day-of-week)
+- What are renewables doing? (wind MW, solar MW)
+- Any outage risk this hour?
+- What is PJM at this hour? How much does MISO track it?
+- Is the gas floor relevant? (typically yes for hours 7-22)
+- What is the net price?
+
+PAY SPECIAL ATTENTION TO:
+- Hours 1-6 (Night): Low demand, gas floor sets minimum, wind matters most
+- Hours 7-9 (Morning ramp): Load accelerates, watch temperature
+- Hours 10-15 (Midday): Solar peak, renewable suppression window
+- Hours 16-20 (Evening peak): HIGHEST RISK HOURS. Demand peaks, solar falls off, wind often drops at sunset. This is where prices spike. Do NOT underestimate.
+- Hours 21-24 (Late evening): Load drops, transition down
+
+RESPOND ONLY WITH THIS JSON (no markdown fences, no text outside the JSON):
+{{
+  "forecast": {{
+    "1": 45.20,
+    "2": 43.80,
+    "3": 42.10,
+    "4": 41.50,
+    "5": 42.00,
+    "6": 44.30,
+    "7": 48.00,
+    "8": 52.00,
+    "9": 55.00,
+    "10": 50.00,
+    "11": 46.00,
+    "12": 44.00,
+    "13": 43.00,
+    "14": 44.00,
+    "15": 46.00,
+    "16": 52.00,
+    "17": 62.00,
+    "18": 68.00,
+    "19": 64.00,
+    "20": 58.00,
+    "21": 52.00,
+    "22": 48.00,
+    "23": 44.00,
+    "24": 40.00
+  }},
+  "signal_summary": "2-3 sentence summary of the dominant signals driving tomorrow's prices",
+  "peak_driver": "what is driving the peak hour price",
+  "risk_flags": "any spike or crash risks worth flagging to the trader"
+}}
+
+All prices in $/MWh. Be specific. Do not hedge. Pick the price you believe is correct.
+Forecast date: {target_date or "tomorrow"} ({dow})"""
+
+            # ── Call Claude with extended thinking ────────────────────────
+            logger.info("Calling claude-opus-4-6 (signal-driven, extended thinking=10000)...")
+            raw = ""
+            try:
+                response = self.claude_client.messages.create(
+                    model="claude-opus-4-6",
+                    max_tokens=16000,
+                    thinking={"type": "enabled", "budget_tokens": 10000},
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                raw = next(
+                    (block.text for block in response.content if block.type == "text"),
+                    "",
+                )
+                if not raw:
+                    raise ValueError("No text block in extended-thinking response")
+                logger.info(f"Extended thinking response: {len(raw)} chars")
+            except Exception as think_err:
+                logger.warning(f"Extended thinking failed ({think_err}), retrying standard...")
+                response = self.claude_client.messages.create(
+                    model="claude-opus-4-6",
+                    max_tokens=6000,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                if response.content:
+                    raw = response.content[0].text
+                logger.info(f"Standard call response: {len(raw)} chars | stop={response.stop_reason}")
+
+            if not raw or not raw.strip():
+                raise ValueError(f"Claude returned empty response (stop={getattr(response, 'stop_reason', '?')})")
+
+            # ── Parse — strip markdown fences and find the JSON object ────
+            clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
+            # Find the outermost JSON object in case Claude added prose before/after
+            json_match = re.search(r'\{[\s\S]*\}', clean)
+            if not json_match:
+                raise ValueError(f"No JSON object found in response (first 200: {clean[:200]!r})")
+            data  = json.loads(json_match.group(0))
+
+            prices_raw     = data.get("forecast", data.get("prices", {}))
+            signal_summary = data.get("signal_summary", "")
+            peak_driver    = data.get("peak_driver", "")
+            risk_flags     = data.get("risk_flags", "")
+
+            refined_prices = []
+            clamped_count  = 0
+            for hour in range(1, 25):
+                base     = base_prices[hour - 1]
+                proposed = float(prices_raw.get(str(hour), base))
+                clamped, was_clamped = _sanity_clamp(hour, proposed, base)
+                if was_clamped:
+                    clamped_count += 1
+                    logger.warning(
+                        f"  Clamp hr{hour:02d}: ${proposed:.2f} → ${clamped:.2f} "
+                        f"(period={_period(hour)})"
+                    )
+                refined_prices.append(clamped)
+
+            logger.info(f"Signal-driven forecast: clamped={clamped_count} hours")
+            logger.info(f"Signal summary: {signal_summary[:120]}")
+            logger.info(f"Risk flags: {risk_flags[:120]}")
+
+            return {
+                "success":        True,
+                "refined_prices": refined_prices,
+                "signal_summary": signal_summary,
+                "peak_driver":    peak_driver,
+                "risk_flags":     risk_flags,
+                "clamped_hours":  clamped_count,
+            }
+
+        except Exception as e:
+            logger.error(f"claude_refine_with_signals failed: {e}")
+            return {
+                "success":        False,
+                "refined_prices": list(base_prices),
+                "signal_summary": "",
+                "peak_driver":    "",
+                "risk_flags":     "",
                 "error":          str(e),
             }
 

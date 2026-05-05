@@ -30,6 +30,22 @@ def _ms_to_mph(ms: float) -> float:
     return ms * 2.237
 
 
+def _cloud_pct_from_forecast(short_forecast: str) -> int:
+    """Estimate cloud cover % from NOAA shortForecast text."""
+    sf = short_forecast.lower()
+    if any(w in sf for w in ("sunny", "clear")):
+        return 5
+    if any(w in sf for w in ("mostly sunny", "mostly clear")):
+        return 20
+    if any(w in sf for w in ("partly", "scattered")):
+        return 50
+    if any(w in sf for w in ("mostly cloudy", "mostly overcast")):
+        return 75
+    if any(w in sf for w in ("cloudy", "overcast", "fog", "rain", "snow", "shower", "storm", "drizzle")):
+        return 90
+    return 50
+
+
 class WeatherScraper:
     """Hourly 24-hour weather forecast for the MISO load center."""
 
@@ -53,16 +69,16 @@ class WeatherScraper:
         # NOAA first — free, no key, good coverage
         result = self._fetch_noaa()
         if result["success"]:
-            return result
+            return _add_flat_arrays(result)
 
         # Fall back to OpenWeatherMap if key is set
         if self._owm_key:
             result = self._fetch_owm()
             if result["success"]:
-                return result
+                return _add_flat_arrays(result)
 
         logger.warning("All weather sources failed — no weather data available")
-        return {"success": False, "hourly": [], "error": "all sources failed"}
+        return {"success": False, "hourly": [], "temps_f": [], "wind_mph": [], "cloud_pct": [], "error": "all sources failed"}
 
     # ------------------------------------------------------------------ #
     # NOAA weather.gov (free, no API key)
@@ -96,7 +112,7 @@ class WeatherScraper:
                     "hour": i + 1,
                     "temp_f": round(temp_f, 1),
                     "wind_mph": round(wind_mph, 1),
-                    "cloud_pct": 50,    # NOAA basic forecast doesn't include cloud %
+                    "cloud_pct": _cloud_pct_from_forecast(p.get("shortForecast", "")),
                     "humidity_pct": int(humidity),
                 })
 
@@ -214,6 +230,20 @@ def _interpret_weather(hourly: List[Dict]) -> tuple:
         signals.append("CLEAR → full solar → downward midday price pressure")
 
     return summary, " | ".join(signals)
+
+
+def _add_flat_arrays(result: Dict) -> Dict:
+    """Append flat 24-value arrays to a successful weather result dict."""
+    hourly = result.get("hourly", [])
+    if hourly:
+        result["temps_f"]  = [h["temp_f"]   for h in hourly]
+        result["wind_mph"] = [h["wind_mph"]  for h in hourly]
+        result["cloud_pct"] = [h["cloud_pct"] for h in hourly]
+    else:
+        result["temps_f"]  = []
+        result["wind_mph"] = []
+        result["cloud_pct"] = []
+    return result
 
 
 def heating_degree_hours(hourly: List[Dict], base_f: float = 65.0) -> float:
