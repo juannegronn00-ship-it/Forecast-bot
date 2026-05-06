@@ -3,6 +3,23 @@ import os
 from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 
+# ─── Daily send guard ────────────────────────────────────────────────────────
+# Checked BEFORE any pipeline work so deploys / API retries don't re-run
+# the full pipeline and re-send on the same calendar day.
+
+def _today_flag_path() -> str:
+    return f"/tmp/forecast_sent_{date.today().strftime('%Y-%m-%d')}.flag"
+
+def _already_sent_today() -> bool:
+    return os.path.exists(_today_flag_path())
+
+def _mark_sent_today() -> None:
+    try:
+        with open(_today_flag_path(), "w") as f:
+            f.write(datetime.utcnow().isoformat())
+    except Exception:
+        pass
+
 from src.scrapers.fantods_scraper import FantodsScraperr
 from src.scrapers.miso_scraper import MISOScraper
 from src.scrapers.miso_realtime_scraper import MISORealtimeScraper
@@ -328,19 +345,25 @@ class ForecastBot:
 
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%B %d, %Y")
         signals = self._ai_signals  # populated by run_forecast()
-        return self.sender.send_forecast(
+        result = self.sender.send_forecast(
             tomorrow,
             final_prices,
             signal_summary=signals.get("signal_summary", ""),
             peak_driver=signals.get("peak_driver", ""),
             risk_flags=signals.get("risk_flags", ""),
         )
+        if result.get("stepdad_ok"):
+            _mark_sent_today()
+        return result
 
     # ────────────────────────────────────────────────────────────────────
     # Local testing entry point
     # ────────────────────────────────────────────────────────────────────
     def run_once(self) -> list:
         """Run pipeline + send (used for local testing only)."""
+        if _already_sent_today():
+            logger.info(f"⏭  Already sent today ({_today_flag_path()}) — skipping.")
+            return []
         prices = self.run_forecast()
         if prices:
             self.send_telegram(prices)
@@ -350,6 +373,10 @@ class ForecastBot:
 def main():
     logger.info("DA-LMP FORECAST BOT STARTING")
     logger.info(f"Time: {datetime.now()}")
+
+    if _already_sent_today():
+        logger.info(f"⏭  Already sent today ({_today_flag_path()}) — exiting.")
+        return True
 
     missing = [v for v in ["CLAUDE_API_KEY"] if not os.getenv(v)]
     if missing:

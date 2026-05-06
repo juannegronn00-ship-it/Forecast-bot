@@ -276,14 +276,9 @@ class TelegramSender:
     ) -> Dict:
         """
         Send forecast to stepdad then to monitoring.
-        Guards:
-          1. daily flag file — blocks re-sends within the same Vercel instance
-          2. _sent_this_run set — blocks duplicate chat_ids within one call
+        Caller is responsible for the daily dedup guard — this method always sends.
         Returns {stepdad_ok, you_ok, errors}.
         """
-        if self._already_sent_today(date_str):
-            return {"stepdad_ok": True, "you_ok": True, "errors": ["already_sent_today"]}
-
         message = self.format_message(
             date_str, prices,
             signal_summary=signal_summary,
@@ -307,9 +302,6 @@ class TelegramSender:
             f"stepdad: {stepdad_err}" if stepdad_err else None,
             f"monitor: {you_err}" if you_err else None,
         ] if e]
-
-        if stepdad_ok:
-            self._mark_sent_today(date_str)
 
         return {"stepdad_ok": stepdad_ok, "you_ok": you_ok, "errors": errors}
 

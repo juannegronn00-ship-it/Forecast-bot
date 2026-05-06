@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from http.server import BaseHTTPRequestHandler
 import sys
 import os
@@ -16,12 +16,26 @@ logger = logging.getLogger(__name__)
 
 
 def _authorized(headers) -> bool:
-    """Allow all requests when CRON_SECRET is unset (dev/local).
-    When set, Vercel injects it automatically — require matching header."""
     secret = os.getenv("CRON_SECRET", "")
     if not secret:
         return True
     return headers.get("Authorization", "") == f"Bearer {secret}"
+
+
+def _today_flag_path() -> str:
+    return f"/tmp/forecast_sent_{date.today().strftime('%Y-%m-%d')}.flag"
+
+
+def _already_sent_today() -> bool:
+    return os.path.exists(_today_flag_path())
+
+
+def _mark_sent_today() -> None:
+    try:
+        with open(_today_flag_path(), "w") as f:
+            f.write(datetime.utcnow().isoformat())
+    except Exception:
+        pass
 
 
 class handler(BaseHTTPRequestHandler):
@@ -29,6 +43,13 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not _authorized(self.headers):
             self._respond(401, {"error": "Unauthorized"})
+            return
+
+        # Guard: check BEFORE running any pipeline work
+        if _already_sent_today():
+            flag = _today_flag_path()
+            logger.info(f"⏭  Already sent today ({flag}) — returning 200 without re-running.")
+            self._respond(200, {"success": True, "skipped": True, "reason": "already_sent_today"})
             return
 
         logger.info("=" * 60)
@@ -42,7 +63,6 @@ class handler(BaseHTTPRequestHandler):
 
             bot = ForecastBot()
 
-            # Step 1: run the forecast pipeline (returns prices, does NOT send WhatsApp)
             final_prices = bot.run_forecast()
 
             if not final_prices or len(final_prices) != 24:
@@ -54,7 +74,6 @@ class handler(BaseHTTPRequestHandler):
             avg = sum(final_prices) / len(final_prices)
             logger.info(f"Pipeline complete | avg=${avg:.2f} | range=${min(final_prices):.2f}–${max(final_prices):.2f}")
 
-            # Step 2: send via Telegram
             logger.info(f"📤 SEND START at {datetime.utcnow().isoformat()} UTC")
             tg_result = bot.send_telegram(final_prices)
             logger.info(f"📤 SEND END   at {datetime.utcnow().isoformat()} UTC")
@@ -62,7 +81,10 @@ class handler(BaseHTTPRequestHandler):
             you_ok = tg_result.get("you_ok", False)
             tg_errors = tg_result.get("errors", [])
 
+            # Mark sent here too — covers the API path (send_telegram marks it
+            # in the local-run path; both paths write the same flag file)
             if stepdad_ok:
+                _mark_sent_today()
                 logger.info(f"✅ Telegram delivered to stepdad for {tomorrow}")
             else:
                 logger.error(f"❌ Telegram to stepdad FAILED. Errors: {tg_errors}")
