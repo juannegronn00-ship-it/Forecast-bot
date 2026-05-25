@@ -4,9 +4,6 @@ from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 
 # ─── Daily send guard ────────────────────────────────────────────────────────
-# Checked BEFORE any pipeline work so deploys / API retries don't re-run
-# the full pipeline and re-send on the same calendar day.
-
 def _today_flag_path() -> str:
     return f"/tmp/forecast_sent_{date.today().strftime('%Y-%m-%d')}.flag"
 
@@ -22,22 +19,16 @@ def _mark_sent_today() -> None:
 
 from src.scrapers.fantods_scraper import FantodsScraperr
 from src.scrapers.miso_scraper import MISOScraper
-from src.scrapers.miso_realtime_scraper import MISORealtimeScraper
-from src.scrapers.miso_outages_scraper import MISOOutagesScraper
-from src.scrapers.weather_scraper import WeatherScraper
 from src.scrapers.gas_prices_scraper import GasPricesScraper
 from src.scrapers.pjm_scraper import PJMScraper
-from src.data.historical_patterns import HistoricalPatterns
-from src.data.calendar_data import (
-    demand_profile_label,
-    daylight_hours,
-    load_adjustment_factor,
-    solar_generation_signal,
-)
-from src.utils.matcher import HourMatcher
+from src.scrapers.historical_scraper import HistoricalScraper
+from src.utils.similar_day_matcher import SimilarDayMatcher
+from src.utils.load_knowledge import get_load_context_for_claude
 from src.ai.refinement import AIRefiner
-from src.data.fantods_optimizer import FantodsOptimizer
 from src.messengers.telegram_sender import TelegramSender
+from src.db import supabase_client as db
+from src.actuals_logger import run_daily_actuals_check, get_bias_corrections
+from src.weekly_digest import is_monday, send_weekly_digest
 
 load_dotenv()
 
@@ -51,18 +42,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Synthetic fallbacks (used when all scrapers fail) ──────────────────────
-# Typical MISO spring load shape (GW)
+# ─── Synthetic fallbacks ─────────────────────────────────────────────────────
 SYNTHETIC_LOAD = [
     88, 85, 83, 82, 83, 86, 92, 100, 105, 107, 108, 108,
     107, 106, 106, 107, 110, 114, 116, 114, 111, 106, 99, 93,
 ]
-# Typical MISO spring wind generation shape (GW)
 SYNTHETIC_WIND = [
     12, 13, 14, 14, 13, 12, 10, 9, 8, 8, 9, 10,
     11, 12, 12, 11, 10, 9, 9, 10, 11, 12, 12, 12,
 ]
-# Typical MISO spring DA-LMP shape ($/MWh)
 SYNTHETIC_PRICES = [
     22, 21, 20, 20, 21, 23, 28, 35, 38, 36, 34, 33,
     32, 31, 32, 34, 37, 42, 45, 43, 40, 36, 30, 25,
@@ -71,17 +59,18 @@ SYNTHETIC_PRICES = [
 
 class ForecastBot:
     """
-    Orchestrates the full DA-LMP forecasting pipeline.
+    DA-LMP forecasting pipeline using similar-day matching + Claude light adjustment.
 
     Steps:
-      1. Fantods  — base DA-LMP prices (40-day rolling mean)
-      2. MISO     — load/wind system forecasts
-      3. Weather  — Chicago temp, wind, cloud cover (NOAA primary)
-      4. Gas      — Henry Hub spot price (EIA API or seasonal estimate)
-      5. History  — same-weekday patterns from fantods price history
-      6. Claude   — expert trading refinement with full context
-      7. Gemini   — validation + surgical rollbacks
-      8. Merge    — final 24-hour price array
+      1. MISO          — tomorrow's load + wind forecast
+      2. HistoricalScraper — last 30 days of load/wind/prices
+      3. SimilarDayMatcher — find top 3 comparable days (weekday/weekend enforced)
+      4. Weighted base — 50/30/20 weighted average of those 3 days' prices
+      5. PJM           — Western Hub price signal
+      6. Gas           — Henry Hub spot price
+      7. LoadKnowledge — hour-by-hour load physics context
+      8. Claude        — light adjustment only (±15% max per hour)
+      9. Telegram      — send forecast + comparison summary to Jason
     """
 
     def __init__(self):
@@ -90,64 +79,48 @@ class ForecastBot:
         if missing:
             raise EnvironmentError(f"Missing required env vars: {missing}")
 
-        self.fantods = FantodsScraperr()
-        self.miso = MISOScraper()
-        self.miso_rt = MISORealtimeScraper()
-        self.miso_outages = MISOOutagesScraper()
-        self.weather = WeatherScraper()
-        self.gas = GasPricesScraper()
-        self.pjm = PJMScraper()
-        self.history = HistoricalPatterns()
-        self.matcher = HourMatcher()
-        self.optimizer = FantodsOptimizer()
-        self.refiner = AIRefiner()
-        self.sender = TelegramSender()
-        self._ai_signals: dict = {}   # populated by run_forecast, consumed by send_telegram
+        self.fantods         = FantodsScraperr()
+        self.miso            = MISOScraper()
+        self.gas             = GasPricesScraper()
+        self.pjm             = PJMScraper()
+        self.hist_scraper    = HistoricalScraper()
+        self.similar_matcher = SimilarDayMatcher()
+        self.refiner         = AIRefiner()
+        self.sender          = TelegramSender()
+        self._ai_signals: dict = {}
+        # scraper_health tracks success/fallback status for the DEGRADED DATA warning
+        self._scraper_health: dict = {}
 
     # ────────────────────────────────────────────────────────────────────
-    # Core pipeline  (returns prices, does NOT send WhatsApp)
+    # Core pipeline
     # ────────────────────────────────────────────────────────────────────
     def run_forecast(self) -> list:
-        """Execute forecast and return 24 final prices."""
+        """Execute the 9-step similar-day pipeline and return 24 final prices."""
         logger.info("=" * 65)
-        logger.info("STARTING DA-LMP FORECAST PIPELINE")
-        tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%B %d, %Y")
+        logger.info("STARTING DA-LMP FORECAST PIPELINE (SIMILAR-DAY MATCHING)")
+        tomorrow_str  = (datetime.now() + timedelta(days=1)).strftime("%B %d, %Y")
         tomorrow_date = date.today() + timedelta(days=1)
-        logger.info(f"Forecasting for: {tomorrow_str}")
+        day_type      = "weekday" if tomorrow_date.weekday() < 5 else "weekend"
+        logger.info(f"Forecasting for: {tomorrow_str} ({tomorrow_date.strftime('%A')} — {day_type})")
         logger.info("=" * 65)
 
-        # ── STEP 1: Fantods base prices ──────────────────────────────────
-        logger.info("\n[1/10] Fantods — base DA-LMP prices...")
-        fantods_result = self.fantods.scrape_data()
-
-        if fantods_result["success"]:
-            base_prices = fantods_result["prices_by_hour"]
-            logger.info(f"✅ Fantods: {len(base_prices)} prices, avg=${sum(base_prices)/len(base_prices):.2f}")
-        else:
-            logger.warning(f"⚠️  Fantods failed: {fantods_result.get('error')} — using synthetic")
-            base_prices = list(SYNTHETIC_PRICES)
-
-        while len(base_prices) < 24:
-            base_prices.append(base_prices[-1] if base_prices else 30.0)
-        base_prices = base_prices[:24]
-
-        # ── STEP 2: MISO load/wind forecasts ────────────────────────────
-        logger.info("\n[2/10] MISO — system load/wind forecasts...")
-        miso_result = self.miso.fetch_data()
+        # ── STEP 1: Tomorrow's load + wind forecast ───────────────────
+        logger.info("\n[1/9] MISO — tomorrow's load + wind forecast...")
+        miso_result   = self.miso.fetch_data()
+        load_forecast = miso_result.get("load_forecast", []) if miso_result["success"] else []
+        wind_forecast = miso_result.get("wind_forecast", []) if miso_result["success"] else []
 
         if miso_result["success"]:
-            load_forecast = miso_result.get("load_forecast", [])
-            wind_forecast = miso_result.get("wind_forecast", [])
             logger.info(f"✅ MISO: load={len(load_forecast)}h, wind={len(wind_forecast)}h")
+            self._scraper_health["miso"] = True
         else:
             logger.warning("⚠️  MISO failed — using synthetic shapes")
-            load_forecast, wind_forecast = [], []
+            self._scraper_health["miso"] = False
 
         if len(load_forecast) < 24:
             load_forecast = list(SYNTHETIC_LOAD)
         if len(wind_forecast) < 24:
             wind_forecast = list(SYNTHETIC_WIND)
-
         load_forecast = load_forecast[:24]
         wind_forecast = wind_forecast[:24]
         logger.info(
@@ -159,180 +132,220 @@ class ForecastBot:
             f"range={min(wind_forecast):.0f}–{max(wind_forecast):.0f} GW"
         )
 
-        # ── STEP 3: Weather ──────────────────────────────────────────────
-        logger.info("\n[3/10] Weather — Chicago MISO load center...")
-        weather_result = self.weather.fetch_data()
-        if weather_result.get("success"):
-            logger.info(f"✅ Weather ({weather_result['source']}): {weather_result['summary']}")
-            logger.info(f"   Signal: {weather_result['trading_signal']}")
+        # Fetch fantods prices now — used as fallback if no similar days found
+        fantods_result = self.fantods.scrape_data()
+        if fantods_result["success"]:
+            fantods_prices = fantods_result["prices_by_hour"][:24]
+            while len(fantods_prices) < 24:
+                fantods_prices.append(fantods_prices[-1] if fantods_prices else 30.0)
+            logger.info(f"   Fantods fallback ready: avg=${sum(fantods_prices)/24:.2f}")
         else:
-            logger.warning("⚠️  Weather fetch failed — no weather context for Claude")
+            fantods_prices = list(SYNTHETIC_PRICES)
+            logger.warning("   Fantods also failed — synthetic prices will be used as fallback")
 
-        # ── STEP 4: Gas prices ───────────────────────────────────────────
-        logger.info("\n[4/10] Gas prices — Henry Hub...")
-        gas_result = self.gas.fetch_data()
-        if gas_result.get("success"):
-            logger.info(f"✅ Gas ({gas_result['source']}): {gas_result['trading_signal']}")
+        # ── STEP 2: 30 days of historical data ───────────────────────
+        logger.info("\n[2/9] Historical scraper — last 30 days of load/wind/prices...")
+        try:
+            historical_data = self.hist_scraper.get_historical_days(days_back=30)
+            logger.info(f"✅ Retrieved {len(historical_data)} historical days")
+        except Exception as e:
+            logger.warning(f"⚠️  Historical scraper failed: {e} — will skip similar-day matching")
+            historical_data = []
+
+        # ── STEP 3: Find top 3 similar days ──────────────────────────
+        logger.info(f"\n[3/9] Similar-day matcher — finding top 3 comparable {day_type}s...")
+        try:
+            similar_days = self.similar_matcher.find_similar_days(
+                load_forecast, wind_forecast, historical_data, tomorrow_date, n_similar=3
+            )
+            logger.info(f"✅ Found {len(similar_days)} similar days (weekday/weekend enforced)")
+            for i, day in enumerate(similar_days):
+                score_pct = max(0, round((1 - day['similarity_score']) * 100, 1))
+                logger.info(
+                    f"   #{i+1}: {day['date'].strftime('%a %b %d')} "
+                    f"({day['days_ago']}d ago) — {score_pct}% similar"
+                )
+        except Exception as e:
+            logger.warning(f"⚠️  Similar-day matching failed: {e}")
+            similar_days = []
+
+        # ── STEP 4: Weighted base forecast ───────────────────────────
+        logger.info("\n[4/9] Computing weighted base forecast (50/30/20)...")
+        if similar_days:
+            try:
+                base_prices = self.similar_matcher.compute_weighted_forecast(similar_days)
+                comparison_summary = self.similar_matcher.format_comparison_summary(
+                    similar_days, tomorrow_date
+                )
+                logger.info(f"✅ Similar-day base: avg=${sum(base_prices)/24:.2f}")
+                logger.info(f"   {comparison_summary}")
+            except Exception as e:
+                logger.warning(f"⚠️  Weighted forecast failed: {e} — using fantods prices")
+                base_prices        = fantods_prices
+                comparison_summary = f"Similar-day weighting failed — using 40-day rolling mean"
         else:
-            logger.warning("⚠️  Gas price fetch failed")
+            logger.warning(
+                f"⚠️  No similar {day_type}s found in last 30 days — "
+                "falling back to fantods prices"
+            )
+            base_prices        = fantods_prices
+            comparison_summary = (
+                f"No similar {day_type} days found in last 30 days — "
+                "base is 40-day rolling mean"
+            )
 
-        # ── STEP 5: PJM market correlation ──────────────────────────────
-        logger.info("\n[5/10] PJM market — interface correlation signal...")
+        while len(base_prices) < 24:
+            base_prices.append(base_prices[-1] if base_prices else 30.0)
+        base_prices = base_prices[:24]
+
+        # ── STEP 5: PJM prices ────────────────────────────────────────
+        logger.info("\n[5/9] PJM — Western Hub price signal...")
         pjm_result = self.pjm.fetch_data()
         if pjm_result.get("success"):
             logger.info(f"✅ PJM ({pjm_result['source']}): {pjm_result['trading_signal']}")
+            self._scraper_health["pjm"] = True
         else:
             logger.warning("⚠️  PJM fetch failed — no interface signal")
+            self._scraper_health["pjm"] = False
 
-        # ── STEP 5a: MISO real-time LMP ─────────────────────────────────
-        logger.info("\n[5a] MISO RT LMP — current price snapshot...")
-        rt_lmp_result = self.miso_rt.fetch_data()
-        if rt_lmp_result.get("success"):
-            logger.info(
-                f"✅ MISO RT LMP: ${rt_lmp_result['rt_lmp_current']:.2f}/MWh "
-                f"(trend={rt_lmp_result['rt_lmp_trend']})"
-            )
+        # ── STEP 6: Gas prices ────────────────────────────────────────
+        logger.info("\n[6/9] Gas — Henry Hub spot price...")
+        gas_result = self.gas.fetch_data()
+        if gas_result.get("success"):
+            logger.info(f"✅ Gas ({gas_result['source']}): {gas_result['trading_signal']}")
+            self._scraper_health["gas"] = True
         else:
-            logger.warning("⚠️  MISO RT LMP unavailable — signal omitted")
+            logger.warning("⚠️  Gas price fetch failed")
+            self._scraper_health["gas"] = False
 
-        # ── STEP 5b: MISO outages ────────────────────────────────────────
-        logger.info("\n[5b] MISO outages — unplanned MW offline...")
-        outages_result = self.miso_outages.fetch_data()
-        if outages_result.get("success"):
-            logger.info(
-                f"✅ MISO outages: {outages_result['outage_mw']:,} MW | "
-                f"alert={outages_result['alert_level']}"
-            )
-        else:
-            logger.warning("⚠️  MISO outages unavailable — assuming normal")
+        # ── STEP 7: Load knowledge context ───────────────────────────
+        logger.info("\n[7/9] Building load knowledge context...")
+        tomorrow_dt  = datetime.combine(tomorrow_date, datetime.min.time())
+        load_context = get_load_context_for_claude(tomorrow_dt)
+        logger.info("✅ Load context built")
 
-        # ── STEP 6: Historical same-weekday patterns ─────────────────────
-        logger.info("\n[6/10] Historical patterns — same weekday analysis...")
-        self.history.load()
-        hist_summary  = ""
-        hist_profile  = []
-        weekday_stats = {}
-        if self.history.loaded:
-            hist_summary  = self.history.summary_for_date(tomorrow_date)
-            hist_profile  = self.history.get_weekday_profile(tomorrow_date.weekday())
-            weekday_stats = self.history.get_weekday_stats(tomorrow_date.weekday())
-            n_hrs = sum(1 for s in weekday_stats.values() if s)
-            logger.info(f"✅ History: {hist_summary}")
-            logger.info(f"   Per-hour stats available: {n_hrs}/24 hours")
-        else:
-            logger.warning("⚠️  Historical patterns unavailable")
-
-        # ── STEP 6: Calendar context ─────────────────────────────────────
-        logger.info("\n[7/10] Calendar context...")
-        cal_label = demand_profile_label(tomorrow_date)
-        dl_hours = daylight_hours(tomorrow_date)
-        lf = load_adjustment_factor(tomorrow_date)
-        solar_signal = solar_generation_signal(tomorrow_date)
-        logger.info(f"   {cal_label}")
-        logger.info(f"   {solar_signal}  |  load_factor={lf:.3f}")
-
-        # Check holiday flag for optimizer
+        # ── STEP 7.5: Bias corrections from historical errors ─────────
+        logger.info("\n[7.5/9] Loading bias corrections from Supabase...")
         try:
-            from src.data.calendar_data import is_holiday
-            holiday_flag = is_holiday(tomorrow_date)
-        except Exception:
-            holiday_flag = False
+            bias_corrections = get_bias_corrections(lookback_days=14)
+            if bias_corrections:
+                logger.info(f"✅ Bias corrections for {len(bias_corrections)} hours loaded")
+            else:
+                logger.info("   No significant bias corrections needed yet")
+        except Exception as e:
+            logger.warning(f"⚠️  Bias correction load failed (non-fatal): {e}")
+            bias_corrections = {}
 
-        # ── STEP 7: Fantods data-driven optimization (zero API cost) ────
-        logger.info("\n[8/10] Fantods optimizer — data-driven shape correction...")
-
-        trader_context = {
-            "weather": weather_result,
-            "gas": gas_result,
-            "pjm": pjm_result,
-            "rt_lmp": rt_lmp_result,
-            "outages": outages_result,
-            "history_summary": hist_summary,
-            "history_profile": hist_profile,
-            "weekday_stats": weekday_stats,
-            "calendar": cal_label,
-            "daylight_hrs": dl_hours,
-            "load_factor": lf,
-            "weekday_int": tomorrow_date.weekday(),
-            "is_holiday": holiday_flag,
-        }
-
-        opt_result = self.optimizer.optimize(
-            base_prices,
-            load_forecast,
-            wind_forecast,
-            trader_context=trader_context,
-        )
-
-        if opt_result["success"]:
-            optimized_prices = opt_result["optimized_prices"]
-            opt_diffs = [round(optimized_prices[i] - base_prices[i], 2) for i in range(24)]
-            logger.info(f"✅ Optimizer complete | deltas vs base: {opt_diffs}")
-        else:
-            logger.warning("⚠️  Optimizer failed — using raw base prices")
-            optimized_prices = list(base_prices)
-
-        # ── STEP 9: Claude signal-driven forecast ───────────────────────
-        # Uses trader's framework: Price ≈ Demand − Renewables + Outages + Congestion.
-        # Reasons from fundamentals — does NOT adjust from a historical base.
-        # Falls back to optimizer output if Claude call fails.
-        logger.info("\n[9/10] Claude signal-driven forecast (trader's framework)...")
-
-        claude_result = self.refiner.claude_refine_with_signals(
-            base_prices,
-            load_forecast,
-            wind_forecast,
-            target_date=tomorrow_str,
-            trader_context=trader_context,
+        # ── STEP 8: Claude signal-weighted adjustment ─────────────────
+        logger.info("\n[8/9] Claude — signal-weighted adjustment (period-sensitive clamps)...")
+        claude_result = self.refiner.claude_light_adjust(
+            base_prices      = base_prices,
+            similar_days     = similar_days,
+            tomorrow_load    = load_forecast,
+            tomorrow_wind    = wind_forecast,
+            pjm_result       = pjm_result,
+            gas_result       = gas_result,
+            load_context     = load_context,
+            target_date      = tomorrow_str,
+            tomorrow_date    = tomorrow_date,
+            bias_corrections = bias_corrections,
         )
 
         if claude_result["success"]:
             refined_prices = claude_result["refined_prices"]
-            clamped = claude_result.get("clamped_hours", 0)
-            logger.info(f"✅ Claude signal-driven forecast complete | clamped={clamped} hours")
+            clamped        = claude_result.get("clamped_hours", 0)
+            logger.info(f"✅ Claude adjustment complete | clamped={clamped} hours")
             diffs = [round(refined_prices[i] - base_prices[i], 2) for i in range(24)]
-            logger.info(f"   Claude deltas vs base: {diffs}")
-            # Store signal metadata for Telegram
+            logger.info(f"   Deltas vs base: {diffs}")
             self._ai_signals = {
-                "signal_summary": claude_result.get("signal_summary", ""),
-                "peak_driver":    claude_result.get("peak_driver", ""),
-                "risk_flags":     claude_result.get("risk_flags", ""),
+                "signal_summary":     claude_result.get("signal_summary", ""),
+                "peak_driver":        claude_result.get("peak_driver", ""),
+                "risk_flags":         claude_result.get("risk_flags", ""),
+                "comparison_summary": comparison_summary,
+                "confidence":         claude_result.get("confidence", {}),
+                "market_bias":        claude_result.get("market_bias", "NEUTRAL"),
+                "market_bias_reason": claude_result.get("market_bias_reason", ""),
             }
         else:
             logger.warning(
-                f"⚠️  Claude failed: {claude_result.get('error')} "
-                f"— falling back to data-driven optimizer output"
+                f"⚠️  Claude failed: {claude_result.get('error')} — using similar-day base"
             )
-            refined_prices = list(optimized_prices)
-            self._ai_signals = {}
+            refined_prices    = list(base_prices)
+            self._ai_signals  = {
+                "comparison_summary": comparison_summary,
+                "confidence":         {h: "LOW" for h in range(1, 25)},
+                "market_bias":        "NEUTRAL",
+                "market_bias_reason": "",
+            }
 
-        # ── STEP 9: Gemini validation ────────────────────────────────────
-        logger.info("\n[10/10] Gemini validation...")
+        # Optional Gemini validation (non-fatal)
+        logger.info("\n[8.5/9] Gemini validation (optional)...")
         gemini_result = self.refiner.gemini_validate(
-            refined_prices,
-            base_prices,
-            load_forecast,
-            wind_forecast,
+            refined_prices, base_prices, load_forecast, wind_forecast
         )
-
         if gemini_result["success"]:
             logger.info(
                 f"✅ Gemini: passed={gemini_result['validation_passed']} "
                 f"| flagged={gemini_result.get('flagged_hours', [])}"
             )
         else:
-            logger.warning(f"⚠️  Gemini failed (non-critical): {gemini_result.get('error')}")
+            logger.warning(f"⚠️  Gemini (non-critical): {gemini_result.get('error')}")
 
-        # ── Merge ────────────────────────────────────────────────────────
         final_prices = self.refiner.merge_results(base_prices, refined_prices, gemini_result)
 
         logger.info(f"\n✅ PIPELINE COMPLETE for {tomorrow_str}")
         logger.info(f"   Range: ${min(final_prices):.2f} – ${max(final_prices):.2f}")
         logger.info(f"   Avg:   ${sum(final_prices)/24:.2f}")
-        logger.info(f"   Final: {final_prices}")
+        logger.info(f"   Final: {[round(p, 2) for p in final_prices]}")
         logger.info("=" * 65 + "\n")
 
+        # ── Log scraper health to Supabase ────────────────────────────
+        self._log_scraper_health()
+
+        # ── Persist forecast to Supabase (for actuals comparison tomorrow) ─
+        self._save_forecast_to_supabase(tomorrow_date, final_prices, base_prices)
+
         return final_prices
+
+    def _log_scraper_health(self) -> None:
+        """Write each scraper's success/failure to the scraper_health table."""
+        today = date.today().isoformat()
+        rows = []
+        for scraper_name, success in self._scraper_health.items():
+            rows.append({
+                "run_date":     today,
+                "scraper_name": scraper_name,
+                "success":      success,
+                "fallback_used": not success,
+            })
+        if rows:
+            db.insert_many("scraper_health", rows)
+            failed = [n for n, s in self._scraper_health.items() if not s]
+            if failed:
+                logger.info(f"Scraper health logged — failed scrapers: {failed}")
+
+    def _save_forecast_to_supabase(
+        self, forecast_date, final_prices: list, base_prices: list
+    ) -> None:
+        """Upsert today's forecast to Supabase so actuals can be compared tomorrow."""
+        signals = self._ai_signals
+        conf    = signals.get("confidence", {})
+        ok = db.upsert("forecasts", {
+            "forecast_date":      forecast_date.isoformat(),
+            "prices":             {str(h+1): round(p, 4) for h, p in enumerate(final_prices)},
+            "confidence":         {str(k): v for k, v in conf.items()},
+            "market_bias":        signals.get("market_bias", "NEUTRAL"),
+            "market_bias_reason": signals.get("market_bias_reason", ""),
+            "signal_summary":     signals.get("signal_summary", ""),
+            "peak_driver":        signals.get("peak_driver", ""),
+            "risk_flags":         signals.get("risk_flags", ""),
+            "base_prices":        {str(h+1): round(p, 4) for h, p in enumerate(base_prices)},
+            "scraper_health":     self._scraper_health,
+        })
+        if ok:
+            logger.info(f"✅ Forecast saved to Supabase for {forecast_date}")
+        else:
+            logger.warning("⚠️  Forecast save to Supabase failed (non-fatal)")
 
     # ────────────────────────────────────────────────────────────────────
     # Telegram delivery
@@ -344,13 +357,25 @@ class ForecastBot:
             return {"stepdad_ok": False, "you_ok": False, "errors": ["TELEGRAM_BOT_TOKEN not set"]}
 
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%B %d, %Y")
-        signals = self._ai_signals  # populated by run_forecast()
+        signals  = self._ai_signals
+
+        # Build degraded-scrapers list for the warning banner
+        failed_scrapers = [
+            name for name, ok in self._scraper_health.items() if not ok
+        ]
+        degraded = failed_scrapers if len(failed_scrapers) >= 2 else None
+
         result = self.sender.send_forecast(
             tomorrow,
             final_prices,
-            signal_summary=signals.get("signal_summary", ""),
-            peak_driver=signals.get("peak_driver", ""),
-            risk_flags=signals.get("risk_flags", ""),
+            confidence          = signals.get("confidence"),
+            market_bias         = signals.get("market_bias", ""),
+            market_bias_reason  = signals.get("market_bias_reason", ""),
+            signal_summary      = signals.get("signal_summary", ""),
+            peak_driver         = signals.get("peak_driver", ""),
+            risk_flags          = signals.get("risk_flags", ""),
+            comparison_summary  = signals.get("comparison_summary", ""),
+            degraded_scrapers   = degraded,
         )
         if result.get("stepdad_ok"):
             _mark_sent_today()
@@ -360,10 +385,33 @@ class ForecastBot:
     # Local testing entry point
     # ────────────────────────────────────────────────────────────────────
     def run_once(self) -> list:
-        """Run pipeline + send (used for local testing only)."""
+        """Run pipeline + send (used for local testing only).
+
+        Uses tomorrow's date as the idempotency key (the DA forecast target)
+        so a rogue off-hours run on the same UTC calendar day as the scheduled
+        cron cannot block it.
+
+        Raises RuntimeError if the Supabase dedup check fails — a broken DB
+        must not silently fall through and cause a send (fails closed).
+        """
+        # DA forecast target date — always tomorrow (same key as api/index.py)
+        target = (date.today() + timedelta(days=1)).isoformat()
+
+        # Primary guard: Supabase sent_forecasts (shared across processes/instances).
+        # already_sent_for() RAISES on config/network error — do not swallow it.
+        try:
+            if db.already_sent_for(target):
+                logger.info(f"⏭  Forecast for {target} already sent — Supabase guard triggered.")
+                return []
+        except RuntimeError as e:
+            logger.error(f"Supabase dedup check failed (failing closed): {e}")
+            raise
+
+        # Secondary guard: /tmp flag file (local dev only)
         if _already_sent_today():
             logger.info(f"⏭  Already sent today ({_today_flag_path()}) — skipping.")
             return []
+
         prices = self.run_forecast()
         if prices:
             self.send_telegram(prices)
@@ -383,8 +431,7 @@ def main():
         logger.error(f"Missing required env vars: {missing}")
         return False
 
-    bot = ForecastBot()
-    logger.info("\n--- RUNNING FORECAST TEST ---\n")
+    bot    = ForecastBot()
     prices = bot.run_once()
 
     if prices:
